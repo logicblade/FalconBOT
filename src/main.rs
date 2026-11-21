@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 
 const REQUIRED_CHANNEL: &str = "@HakuNGVPN";
 const REQUIRED_CHANNEL_URL: &str = "https://t.me/HakuNGVPN";
-const MONTHLY_PLAN_GB: [u16; 8] = [10, 20, 30, 50, 80, 100, 200, 250];
+const MONTHLY_PLAN_GB: [u16; 10] = [10, 20, 30, 50, 80, 100, 150, 200, 250, 300];
 const USER_MENU_PROMPT: &str = "از منوی زیر انتخاب کن 👇🏻";
 
 fn start_user_menu_prompt(first_name: &str) -> String {
@@ -159,29 +159,29 @@ fn user_menu_rich_message(prompt: &str) -> UserMenuRichMessage {
             },
             UserMenuBlock::Buttons {
                 buttons: vec![button(
-                    "🚀 خرید اشتراک 💰",
-                    "user:buy",
+                    "🚀 خرید و تمدید اشتراک 💰",
+                    "user:purchase-menu",
                     UserMenuButtonStyle::Primary,
                 )],
             },
             UserMenuBlock::Buttons {
                 buttons: vec![button(
-                    "تمدید اشتراک ♻️",
-                    "user:renew",
+                    "⚡️ مدیریت اشتراک ⚙️",
+                    "user:management-menu",
                     UserMenuButtonStyle::Primary,
                 )],
             },
             UserMenuBlock::Buttons {
                 buttons: vec![button(
-                    "📊 چقدر حجم دارم؟",
-                    "user:usage",
+                    "🎁 زیر مجموعه گیری ‼️",
+                    "user:referral",
                     UserMenuButtonStyle::Primary,
                 )],
             },
             UserMenuBlock::Buttons {
                 buttons: vec![button(
-                    "🔗 دریافت لینک کانفیگ",
-                    "user:link",
+                    "〽️ کیف پول من 💵",
+                    "user:wallet",
                     UserMenuButtonStyle::Primary,
                 )],
             },
@@ -1272,6 +1272,42 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
         "owner:main" if is_owner => {
             bot.send_message(query.from.id, "از منوی زیر برای مدیریت ربات استفاده کنید.")
                 .reply_markup(owner_keyboard())
+                .await?;
+        }
+        "user:purchase-menu" => {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+                return Ok(());
+            }
+            edit_user_message_with_keyboard(
+                &bot,
+                target,
+                "خرید یا تمدید اشتراک را انتخاب کنید:",
+                purchase_menu_keyboard(),
+            )
+            .await?;
+        }
+        "user:management-menu" => {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+                return Ok(());
+            }
+            edit_user_message_with_keyboard(
+                &bot,
+                target,
+                "بخش مدیریت اشتراک را انتخاب کنید:",
+                subscription_management_keyboard(),
+            )
+            .await?;
+        }
+        "user:referral" | "user:wallet" => {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+                return Ok(());
+            }
+            let message = if data == "user:referral" {
+                "🎁 قابلیت زیرمجموعه‌گیری به‌زودی فعال می‌شود."
+            } else {
+                "〽️ قابلیت کیف پول به‌زودی فعال می‌شود."
+            };
+            edit_user_message_with_keyboard(&bot, target, message, subscription_back_keyboard())
                 .await?;
         }
         data if data.starts_with("payment:cancel:") => {
@@ -3011,13 +3047,47 @@ fn admin_list_keyboard(admin_ids: &[u64]) -> InlineKeyboardMarkup {
 fn user_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
-            "🚀 خرید اشتراک 💰",
+            "🚀 خرید و تمدید اشتراک 💰",
+            "user:purchase-menu",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "⚡️ مدیریت اشتراک ⚙️",
+            "user:management-menu",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🎁 زیر مجموعه گیری ‼️",
+            "user:referral",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "〽️ کیف پول من 💵",
+            "user:wallet",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "👨🏻‍💻 پشتیبانی",
+            "user:support",
+        )],
+    ])
+}
+
+fn purchase_menu_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🔋 خرید اشتراک  🚀",
             "user:buy",
         )],
         vec![InlineKeyboardButton::callback(
-            "تمدید اشتراک ♻️",
+            "🚀 تمدید اشتراک ♻️",
             "user:renew",
         )],
+        vec![InlineKeyboardButton::callback(
+            "🏠 بازگشت به منوی اصلی",
+            "user:menu",
+        )],
+    ])
+}
+
+fn subscription_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
             "📊 چقدر حجم دارم؟",
             "user:usage",
@@ -3027,8 +3097,8 @@ fn user_keyboard() -> InlineKeyboardMarkup {
             "user:link",
         )],
         vec![InlineKeyboardButton::callback(
-            "👨🏻‍💻 پشتیبانی",
-            "user:support",
+            "🏠 بازگشت به منوی اصلی",
+            "user:menu",
         )],
     ])
 }
@@ -3197,15 +3267,19 @@ fn monthly_plan_keyboard(
 }
 
 fn monthly_plan_price(gb: u16) -> Option<u32> {
-    if !MONTHLY_PLAN_GB.contains(&gb) {
-        return None;
+    match gb {
+        10 => Some(60_000),
+        20 => Some(115_000),
+        30 => Some(165_000),
+        50 => Some(255_000),
+        80 => Some(370_000),
+        100 => Some(450_000),
+        150 => Some(675_000),
+        200 => Some(850_000),
+        250 => Some(1_025_000),
+        300 => Some(1_200_000),
+        _ => None,
     }
-
-    let gb = u32::from(gb);
-    let price_per_gb = if gb <= 100 { 4_000 } else { 3_000 };
-    let base_price = gb * price_per_gb;
-    let discount = if gb == 10 { 0 } else { (gb / 10) * 5_000 };
-    Some(base_price - discount)
 }
 
 fn persian_digits(value: impl ToString) -> String {
@@ -3315,6 +3389,10 @@ mod tests {
 
     #[test]
     fn monthly_plan_prices_follow_the_requested_tiers() {
+        assert_eq!(
+            MONTHLY_PLAN_GB,
+            [10, 20, 30, 50, 80, 100, 150, 200, 250, 300]
+        );
         let prices = MONTHLY_PLAN_GB
             .iter()
             .map(|gb| monthly_plan_price(*gb).unwrap())
@@ -3322,7 +3400,10 @@ mod tests {
 
         assert_eq!(
             prices,
-            vec![40_000, 70_000, 105_000, 175_000, 280_000, 350_000, 500_000, 625_000]
+            vec![
+                60_000, 115_000, 165_000, 255_000, 370_000, 450_000, 675_000, 850_000, 1_025_000,
+                1_200_000
+            ]
         );
         assert_eq!(monthly_plan_price(101), None);
     }
@@ -3387,29 +3468,68 @@ mod tests {
                 .map(|button| button.text.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "🚀 خرید اشتراک 💰",
-                "تمدید اشتراک ♻️",
-                "📊 چقدر حجم دارم؟",
-                "🔗 دریافت لینک کانفیگ",
+                "🚀 خرید و تمدید اشتراک 💰",
+                "⚡️ مدیریت اشتراک ⚙️",
+                "🎁 زیر مجموعه گیری ‼️",
+                "〽️ کیف پول من 💵",
                 "👨🏻‍💻 پشتیبانی"
             ]
         );
         assert!(rows.iter().flatten().any(|button| matches!(
             &button.kind,
-            InlineKeyboardButtonKind::CallbackData(data) if data == "user:renew"
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:purchase-menu"
         )));
         assert!(rows.iter().flatten().any(|button| matches!(
             &button.kind,
-            InlineKeyboardButtonKind::CallbackData(data) if data == "user:usage"
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:management-menu"
         )));
         assert!(rows.iter().flatten().any(|button| matches!(
             &button.kind,
-            InlineKeyboardButtonKind::CallbackData(data) if data == "user:link"
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:referral"
+        )));
+        assert!(rows.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:wallet"
         )));
         assert!(rows.iter().flatten().any(|button| matches!(
             &button.kind,
             InlineKeyboardButtonKind::CallbackData(data) if data == "user:support"
         )));
+        assert!(purchase_menu_keyboard()
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .any(|button| matches!(
+                &button.kind,
+                InlineKeyboardButtonKind::CallbackData(data) if data == "user:buy"
+            )));
+        assert!(purchase_menu_keyboard()
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .any(|button| matches!(
+                &button.kind,
+                InlineKeyboardButtonKind::CallbackData(data) if data == "user:renew"
+            )));
+        let purchase_buttons = purchase_menu_keyboard().inline_keyboard;
+        assert_eq!(purchase_buttons[0][0].text, "🔋 خرید اشتراک  🚀");
+        assert_eq!(purchase_buttons[1][0].text, "🚀 تمدید اشتراک ♻️");
+        assert!(subscription_management_keyboard()
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .any(|button| matches!(
+                &button.kind,
+                InlineKeyboardButtonKind::CallbackData(data) if data == "user:usage"
+            )));
+        assert!(subscription_management_keyboard()
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .any(|button| matches!(
+                &button.kind,
+                InlineKeyboardButtonKind::CallbackData(data) if data == "user:link"
+            )));
         assert!(matches!(
             &support_keyboard().inline_keyboard[0][0].kind,
             InlineKeyboardButtonKind::Url(url) if url.as_str() == "https://t.me/ipublicsupport"
@@ -3443,10 +3563,10 @@ mod tests {
                 .map(|button| button.text.as_str())
                 .collect::<Vec<_>>(),
             vec![
-                "🚀 خرید اشتراک 💰",
-                "تمدید اشتراک ♻️",
-                "📊 چقدر حجم دارم؟",
-                "🔗 دریافت لینک کانفیگ",
+                "🚀 خرید و تمدید اشتراک 💰",
+                "⚡️ مدیریت اشتراک ⚙️",
+                "🎁 زیر مجموعه گیری ‼️",
+                "〽️ کیف پول من 💵",
                 "👨🏻‍💻 پشتیبانی"
             ]
         );
@@ -3457,10 +3577,10 @@ mod tests {
                 .map(|button| button.callback_data.as_deref().unwrap_or_default())
                 .collect::<Vec<_>>(),
             vec![
-                "user:buy",
-                "user:renew",
-                "user:usage",
-                "user:link",
+                "user:purchase-menu",
+                "user:management-menu",
+                "user:referral",
+                "user:wallet",
                 "user:support"
             ]
         );
