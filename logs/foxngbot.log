@@ -267,3 +267,44 @@
 [2026-11-21 05:49:23.881 +03:30] [INFO ] FOXNG Rust bot started
 [2026-11-21 05:49:29.317 +03:30] [INFO ] User 7933838083 opened the start menu
 [2026-11-21 05:49:46.155 +03:30] [ERROR] Could not send rich receipt confirmation to chat 7933838083: Telegram rejected the rich message: Bad Request: can't parse InputRichBlock: type "block_quotation" is unsupported
+[2026-11-21 05:54:39.687 +03:30] [INFO ] ^C received, trying to shutdown the dispatcher...
+[2026-11-21 05:54:39.687 +03:30] [INFO ] Trying to shutdown the dispatcher...
+[2026-11-21 05:54:43.104 +03:30] [INFO ] Dispatching has been shut down.
+[2026-11-21 05:54:43.104 +03:30] [INFO ] dispatcher is shutdown...
+[2026-11-21 06:02:35.360 +03:30] [INFO ] Terminal and file logging started: logs/foxngbot.log
+[2026-11-21 06:02:36.316 +03:30] [INFO ] Panel session restored automatically
+[2026-11-21 06:02:36.759 +03:30] [INFO ] FOXNG Rust bot started
+[2026-11-21 06:02:37.591 +03:30] [ERROR] Error: A Telegram's error: Unknown error: "Bad Request: query is too old and response timeout expired or query ID is invalid"
+
+Caused by:
+    Unknown error: "Bad Request: query is too old and response timeout expired or query ID is invalid"
+[2026-11-21 06:02:46.221 +03:30] [INFO ] ^C received, trying to shutdown the dispatcher...
+[2026-11-21 06:02:46.222 +03:30] [INFO ] Trying to shutdown the dispatcher...
+[2026-11-21 06:02:46.349 +03:30] [INFO ] Dispatching has been shut down.
+[2026-11-21 06:02:46.349 +03:30] [INFO ] dispatcher is shutdown...
+[2026-11-21 06:03:12.550 +03:30] [INFO ] Terminal and file logging started: logs/foxngbot.log
+[2026-11-21 06:03:13.303 +03:30] [INFO ] Panel session restored automatically
+[2026-11-21 06:03:13.727 +03:30] [INFO ] FOXNG Rust bot started
+[2026-11-21 06:03:26.487 +03:30] [INFO ] User 7933838083 opened the start menu
+[2026-11-21 06:03:49.447 +03:30] [INFO ] User 7620847874 opened the start menu
+[2026-11-21 06:03:51.284 +03:30] [ERROR] Could not send rich receipt confirmation to chat 7933838083: Telegram sendRichMessage was rejected: Bad Request: can't parse InputRichBlock: type "block_quotation" is unsupported
+[2026-11-21 06:04:13.308 +03:30] [ERROR] Error: Telegram editMessageText was rejected: Bad Request: there is no text in the message to edit
+[2026-11-21 06:04:20.237 +03:30] [ERROR] Error: Telegram editMessageText was rejected: Bad Request: there is no text in the message to edit
+[2026-11-21 06:04:24.750 +03:30] [ERROR] Error: Telegram editMessageText was rejected: Bad Request: there is no text in the message to edit
+[2026-11-21 06:04:53.869 +03:30] [INFO ] Owner 714056642 opened the start menu
+[2026-11-21 06:05:08.002 +03:30] [INFO ] User 7933838083 opened the start menu
+[2026-11-21 06:05:40.981 +03:30] [ERROR] Error: Telegram editMessageText was rejected: Bad Request: there is no text in the message to edit
+[2026-11-21 06:06:18.099 +03:30] [INFO ] ^C received, trying to shutdown the dispatcher...
+[2026-11-21 06:06:18.100 +03:30] [INFO ] Trying to shutdown the dispatcher...
+[2026-11-21 06:06:21.232 +03:30] [INFO ] Dispatching has been shut down.
+[2026-11-21 06:06:21.232 +03:30] [INFO ] dispatcher is shutdown...
+[2026-11-21 06:09:14.869 +03:30] [INFO ] Terminal and file logging started: logs/foxngbot.log
+[2026-11-21 06:09:15.607 +03:30] [INFO ] Panel session restored automatically
+[2026-11-21 06:09:15.991 +03:30] [INFO ] FOXNG Rust bot started
+[2026-11-21 06:09:34.606 +03:30] [INFO ] User 7933838083 opened the start menu
+[2026-11-21 06:10:00.876 +03:30] [ERROR] Could not send rich receipt confirmation to chat 7933838083: Telegram sendRichMessage was rejected: Bad Request: can't parse InputRichBlock: type "block_quotation" is unsupported
+[2026-11-21 06:10:08.214 +03:30] [ERROR] Could not provision approved order 17: پنل درخواست را نپذیرفت (HTTP 404).
+[2026-11-21 06:13:56.681 +03:30] [INFO ] ^C received, trying to shutdown the dispatcher...
+[2026-11-21 06:13:56.681 +03:30] [INFO ] Trying to shutdown the dispatcher...
+[2026-11-21 06:13:57.100 +03:30] [INFO ] Dispatching has been shut down.
+[2026-11-21 06:13:57.100 +03:30] [INFO ] dispatcher is shutdown...

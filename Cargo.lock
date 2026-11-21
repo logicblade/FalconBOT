@@ -762,6 +762,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde",
+ "serde_json",
  "teloxide",
  "thiserror",
  "tokio",

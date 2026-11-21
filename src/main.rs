@@ -90,10 +90,58 @@ struct SendRichMessageRequest {
     rich_message: UserMenuRichMessage,
 }
 
+#[derive(Serialize)]
+struct EditRichMessageRequest {
+    chat_id: i64,
+    message_id: i32,
+    rich_message: UserMenuRichMessage,
+}
+
+#[derive(Serialize)]
+struct EditTextMessageRequest {
+    chat_id: i64,
+    message_id: i32,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+#[derive(Serialize)]
+struct EditInputMediaPhoto<'a> {
+    #[serde(rename = "type")]
+    media_type: &'static str,
+    media: &'static str,
+    caption: &'a str,
+    parse_mode: &'static str,
+}
+
 #[derive(Deserialize)]
 struct TelegramApiResponse {
     ok: bool,
     description: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CallbackMessageTarget {
+    chat_id: ChatId,
+    message_id: MessageId,
+}
+
+fn callback_message_target(query: &CallbackQuery) -> Option<CallbackMessageTarget> {
+    query
+        .regular_message()
+        .map(|message| CallbackMessageTarget {
+            chat_id: message.chat.id,
+            message_id: message.id,
+        })
+}
+
+fn require_callback_message_target(
+    target: Option<CallbackMessageTarget>,
+) -> Result<CallbackMessageTarget> {
+    target.ok_or_else(|| anyhow!("Callback query does not contain an editable message"))
 }
 
 fn user_menu_rich_message(prompt: &str) -> UserMenuRichMessage {
@@ -200,42 +248,148 @@ async fn send_rich_message(
         chat_id: chat_id.0,
         rich_message,
     };
+    call_telegram_api(bot, "sendRichMessage", &request).await
+}
+
+async fn edit_rich_message(
+    bot: &Bot,
+    target: CallbackMessageTarget,
+    rich_message: UserMenuRichMessage,
+) -> Result<()> {
+    let request = EditRichMessageRequest {
+        chat_id: target.chat_id.0,
+        message_id: target.message_id.0,
+        rich_message,
+    };
+    call_telegram_api(bot, "editMessageText", &request).await
+}
+
+async fn edit_text_message(
+    bot: &Bot,
+    target: CallbackMessageTarget,
+    text: impl Into<String>,
+    parse_mode: Option<&'static str>,
+    reply_markup: Option<InlineKeyboardMarkup>,
+) -> Result<()> {
+    let request = EditTextMessageRequest {
+        chat_id: target.chat_id.0,
+        message_id: target.message_id.0,
+        text: text.into(),
+        parse_mode,
+        reply_markup,
+    };
+    call_telegram_api(bot, "editMessageText", &request).await
+}
+
+async fn edit_photo_message(
+    bot: &Bot,
+    target: CallbackMessageTarget,
+    image: Vec<u8>,
+    caption: &str,
+    keyboard: &InlineKeyboardMarkup,
+) -> Result<()> {
+    let media = EditInputMediaPhoto {
+        media_type: "photo",
+        media: "attach://photo",
+        caption,
+        parse_mode: "HTML",
+    };
+    let form = reqwest::multipart::Form::new()
+        .text("chat_id", target.chat_id.0.to_string())
+        .text("message_id", target.message_id.0.to_string())
+        .text("media", serde_json::to_string(&media)?)
+        .text("reply_markup", serde_json::to_string(keyboard)?)
+        .part(
+            "photo",
+            reqwest::multipart::Part::bytes(image)
+                .file_name("subscription-qr.png")
+                .mime_str("image/png")?,
+        );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .context("Could not create Telegram media-edit client")?;
+    let response = client
+        .post(format!(
+            "https://api.telegram.org/bot{}/editMessageMedia",
+            bot.token()
+        ))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow!(
+                "Telegram editMessageMedia request failed: {}",
+                error.without_url()
+            )
+        })?;
+    check_telegram_api_response(response, "editMessageMedia").await
+}
+
+async fn call_telegram_api<T: Serialize>(bot: &Bot, method: &str, request: &T) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .context("Could not create Telegram rich-message client")?;
     let response = client
         .post(format!(
-            "https://api.telegram.org/bot{}/sendRichMessage",
-            bot.token()
+            "https://api.telegram.org/bot{}/{method}",
+            bot.token(),
         ))
-        .json(&request)
+        .json(request)
         .send()
         .await
-        .map_err(|error| {
-            anyhow!(
-                "Telegram rich-message request failed: {}",
-                error.without_url()
-            )
-        })?;
+        .map_err(|error| anyhow!("Telegram {method} request failed: {}", error.without_url()))?;
+    check_telegram_api_response(response, method).await
+}
+
+async fn check_telegram_api_response(response: reqwest::Response, method: &str) -> Result<()> {
     let response = response
         .json::<TelegramApiResponse>()
         .await
         .map_err(|error| {
             anyhow!(
-                "Could not read Telegram rich-message response: {}",
+                "Could not read Telegram {method} response: {}",
                 error.without_url()
             )
         })?;
     if !response.ok {
         return Err(anyhow!(
-            "Telegram rejected the rich message: {}",
+            "Telegram {method} was rejected: {}",
             response
                 .description
                 .unwrap_or_else(|| "no error description".to_owned())
         ));
     }
     Ok(())
+}
+
+async fn edit_user_message_with_keyboard(
+    bot: &Bot,
+    target: impl Into<Option<CallbackMessageTarget>>,
+    text: &str,
+    keyboard: InlineKeyboardMarkup,
+) -> Result<()> {
+    let rich_message = text_message_rich_message(text, &keyboard)?;
+    edit_rich_message(
+        bot,
+        require_callback_message_target(target.into())?,
+        rich_message,
+    )
+    .await
+}
+
+async fn edit_user_menu(
+    bot: &Bot,
+    target: Option<CallbackMessageTarget>,
+    prompt: &str,
+) -> Result<()> {
+    edit_rich_message(
+        bot,
+        require_callback_message_target(target)?,
+        user_menu_rich_message(prompt),
+    )
+    .await
 }
 
 async fn send_text_message_with_keyboard(
@@ -444,7 +598,7 @@ async fn restore_panel_session(state: &AppState) {
     }
 }
 
-async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> ResponseResult<()> {
+async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<()> {
     let Some(sender) = msg.from.as_ref() else {
         return Ok(());
     };
@@ -896,13 +1050,21 @@ async fn broadcast_message(
     Ok(())
 }
 
-async fn handle_callback_query(
-    bot: Bot,
-    query: CallbackQuery,
-    state: Arc<AppState>,
-) -> ResponseResult<()> {
+async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppState>) -> Result<()> {
     bot.answer_callback_query(query.id.clone()).await?;
+    let target = callback_message_target(&query);
     let data = query.data.as_deref().unwrap_or_default();
+    if (data.starts_with("user:") || data.starts_with("payment:cancel:"))
+        && target.is_some_and(|target| target.chat_id.0 != query.from.id.0 as i64)
+    {
+        send_user_menu(
+            &bot,
+            query.from.id,
+            "برای حفظ حریم خصوصی، لطفاً ربات را در گفت‌وگوی خصوصی باز کنید.",
+        )
+        .await?;
+        return Ok(());
+    }
     let is_owner = query.from.id == state.owner_id;
     let is_admin = if is_owner {
         false
@@ -943,14 +1105,22 @@ async fn handle_callback_query(
                 } else {
                     "این عملیات فعلاً در دسترس نیست."
                 };
-                bot.send_message(query.from.id, message).await?;
+                edit_user_message_with_keyboard(
+                    &bot,
+                    target,
+                    message,
+                    subscription_back_keyboard(),
+                )
+                .await?;
                 return Ok(());
             }
             Err(error) => {
                 log::error!("Could not read purchase/renewal availability: {error}");
-                bot.send_message(
-                    query.from.id,
+                edit_user_message_with_keyboard(
+                    &bot,
+                    target,
                     "بررسی وضعیت خرید یا تمدید ممکن نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
                 )
                 .await?;
                 return Ok(());
@@ -1105,7 +1275,7 @@ async fn handle_callback_query(
                 .await?;
         }
         data if data.starts_with("payment:cancel:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             match state.cancel_awaiting_order(query.from.id.0) {
@@ -1127,33 +1297,39 @@ async fn handle_callback_query(
             }
         }
         "user:buy" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            send_user_message_with_keyboard(
+            edit_user_message_with_keyboard(
                 &bot,
-                query.from.id,
+                target,
                 "مدت اشتراک را انتخاب کنید:",
                 subscription_period_keyboard(),
             )
             .await?;
         }
         "user:renew" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            send_panel_client_choices(&bot, &query.from, &state, ClientListPurpose::Renewal)
-                .await?;
+            send_panel_client_choices(
+                &bot,
+                target,
+                &query.from,
+                &state,
+                ClientListPurpose::Renewal,
+            )
+            .await?;
         }
         data if data.starts_with("user:renew:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             let username = data.strip_prefix("user:renew:select:").unwrap_or_default();
-            send_renewal_plans(&bot, &query.from, &state, username).await?;
+            send_renewal_plans(&bot, target, &query.from, &state, username).await?;
         }
         data if data.starts_with("user:renew:plan:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             let selection = data.strip_prefix("user:renew:plan:").unwrap_or_default();
@@ -1163,31 +1339,39 @@ async fn handle_callback_query(
                 .filter(|(gb, _)| monthly_plan_price(*gb).is_some())
                 .unwrap_or((0, ""));
             if plan_gb == 0 || username.is_empty() {
-                send_user_menu(
+                edit_user_message_with_keyboard(
                     &bot,
-                    query.from.id,
+                    target,
                     "تعرفه یا کلاینت انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
+                    subscription_back_keyboard(),
                 )
                 .await?;
             } else {
-                process_subscription_selection(&bot, &query.from, plan_gb, Some(username), &state)
-                    .await?;
+                process_subscription_selection(
+                    &bot,
+                    target,
+                    &query.from,
+                    plan_gb,
+                    Some(username),
+                    &state,
+                )
+                .await?;
             }
         }
         "user:plans:month" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            send_user_message_with_keyboard(
+            edit_user_message_with_keyboard(
                 &bot,
-                query.from.id,
+                target,
                 "پلن خریدتو انتخاب کن 👇",
                 monthly_plans_keyboard(),
             )
             .await?;
         }
         "user:main" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             if let Err(error) = state.cancel_awaiting_order(query.from.id.0) {
@@ -1199,41 +1383,43 @@ async fn handle_callback_query(
             send_user_menu(&bot, query.from.id, USER_MENU_PROMPT).await?;
         }
         "user:menu" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             send_user_menu(&bot, query.from.id, USER_MENU_PROMPT).await?;
         }
         "user:usage" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            send_panel_client_choices(&bot, &query.from, &state, ClientListPurpose::Usage).await?;
+            send_panel_client_choices(&bot, target, &query.from, &state, ClientListPurpose::Usage)
+                .await?;
         }
         "user:link" => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            send_panel_client_choices(&bot, &query.from, &state, ClientListPurpose::Link).await?;
+            send_panel_client_choices(&bot, target, &query.from, &state, ClientListPurpose::Link)
+                .await?;
         }
         data if data.starts_with("user:usage:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             let username = data.strip_prefix("user:usage:select:").unwrap_or_default();
-            send_subscription_usage(&bot, &query.from, &state, username).await?;
+            send_subscription_usage(&bot, target, &query.from, &state, username).await?;
         }
         data if data.starts_with("user:link:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             let username = data.strip_prefix("user:link:select:").unwrap_or_default();
-            send_client_subscription_link(&bot, &query.from, &state, username).await?;
+            send_client_subscription_link(&bot, target, &query.from, &state, username).await?;
         }
         "user:support" => {
-            send_user_message_with_keyboard(
+            edit_user_message_with_keyboard(
                 &bot,
-                query.from.id,
+                target,
                 "برای ارتباط با پشتیبانی از دکمه زیر استفاده کن 👇🏼",
                 support_keyboard(),
             )
@@ -1273,7 +1459,7 @@ async fn handle_callback_query(
             }
         }
         data if data.starts_with("user:plan:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, query.from.id).await? {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
             let plan_gb = data
@@ -1281,12 +1467,13 @@ async fn handle_callback_query(
                 .and_then(|value| value.parse::<u16>().ok());
             match plan_gb.filter(|gb| monthly_plan_price(*gb).is_some()) {
                 Some(gb) => {
-                    process_subscription_selection(&bot, &query.from, gb, None, &state).await?
+                    process_subscription_selection(&bot, target, &query.from, gb, None, &state)
+                        .await?
                 }
                 None => {
-                    send_user_message_with_keyboard(
+                    edit_user_message_with_keyboard(
                         &bot,
-                        query.from.id,
+                        target,
                         "تعرفه‌ی انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
                         monthly_plans_keyboard(),
                     )
@@ -1298,12 +1485,12 @@ async fn handle_callback_query(
             Ok(true) => {
                 log::info!("User {} joined the required channel", query.from.id);
                 let prompt = start_user_menu_prompt(&query.from.first_name);
-                send_user_menu(&bot, query.from.id, &prompt).await?;
+                edit_user_menu(&bot, target, &prompt).await?;
             }
             Ok(false) => {
-                send_user_message_with_keyboard(
+                edit_user_message_with_keyboard(
                     &bot,
-                    query.from.id,
+                    target,
                     "هنوز عضویت شما تأیید نشده است. ابتدا عضو کانال شوید و دوباره بررسی کنید.",
                     join_channel_keyboard(),
                 )
@@ -1314,9 +1501,9 @@ async fn handle_callback_query(
                     "Could not verify channel membership for user {}: {error}",
                     query.from.id
                 );
-                send_user_message_with_keyboard(
+                edit_user_message_with_keyboard(
                     &bot,
-                    query.from.id,
+                    target,
                     "بررسی عضویت ممکن نشد. لطفاً بعداً دوباره تلاش کنید.",
                     join_channel_keyboard(),
                 )
@@ -1352,25 +1539,30 @@ fn panel_api_context(state: &AppState) -> Result<Option<(Url, Zeroizing<String>)
 
 async fn send_panel_client_choices(
     bot: &Bot,
+    target: Option<CallbackMessageTarget>,
     telegram_user: &User,
     state: &AppState,
     purpose: ClientListPurpose,
-) -> ResponseResult<()> {
+) -> Result<()> {
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
         Ok(None) => {
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
         Err(error) => {
             log::error!("Could not prepare panel connection for client listing: {error:#}");
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1389,8 +1581,13 @@ async fn send_panel_client_choices(
                 "Could not list panel clients for user {}: {error}",
                 telegram_user.id
             );
-            bot.send_message(telegram_user.id, error.user_message())
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &error.user_message(),
+                subscription_back_keyboard(),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1402,7 +1599,7 @@ async fn send_panel_client_choices(
             ClientListPurpose::Usage => "برای شناسه‌ی تلگرام شما کلاینتی در پنل پیدا نشد.",
             ClientListPurpose::Link => "برای شناسه‌ی تلگرام شما کلاینتی در پنل پیدا نشد.",
         };
-        send_user_menu(bot, telegram_user.id, message).await?;
+        edit_user_menu(bot, target, message).await?;
         return Ok(());
     }
 
@@ -1417,9 +1614,9 @@ async fn send_panel_client_choices(
             "کلاینتی را انتخاب کنید تا لینک سابسکریپشن همان کلاینت برایتان ارسال شود:\n🟢 فعال  🔴 منقضی"
         }
     };
-    send_user_message_with_keyboard(
+    edit_user_message_with_keyboard(
         bot,
-        telegram_user.id,
+        target,
         prompt,
         panel_client_keyboard(&clients, purpose),
     )
@@ -1429,25 +1626,30 @@ async fn send_panel_client_choices(
 
 async fn send_renewal_plans(
     bot: &Bot,
+    target: Option<CallbackMessageTarget>,
     telegram_user: &User,
     state: &AppState,
     selected_username: &str,
-) -> ResponseResult<()> {
+) -> Result<()> {
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
         Ok(None) => {
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
         Err(error) => {
             log::error!("Could not prepare panel connection for renewal: {error:#}");
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1466,8 +1668,13 @@ async fn send_renewal_plans(
                 "Could not verify renewal client for user {}: {error}",
                 telegram_user.id
             );
-            bot.send_message(telegram_user.id, error.user_message())
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &error.user_message(),
+                subscription_back_keyboard(),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1475,18 +1682,19 @@ async fn send_renewal_plans(
         .iter()
         .find(|client| client.username == selected_username)
     else {
-        send_user_menu(
+        edit_user_message_with_keyboard(
             bot,
-            telegram_user.id,
+            target,
             "این کلاینت در حساب شما پیدا نشد؛ فهرست را دوباره باز کنید.",
+            subscription_back_keyboard(),
         )
         .await?;
         return Ok(());
     };
-    send_user_message_with_keyboard(
+    edit_user_message_with_keyboard(
         bot,
-        telegram_user.id,
-        format!("بسته‌ی تمدید برای «{}» را انتخاب کنید:", client.username),
+        target,
+        &format!("بسته‌ی تمدید برای «{}» را انتخاب کنید:", client.username),
         monthly_renewal_plans_keyboard(&client.username),
     )
     .await?;
@@ -1495,25 +1703,30 @@ async fn send_renewal_plans(
 
 async fn send_subscription_usage(
     bot: &Bot,
+    target: Option<CallbackMessageTarget>,
     telegram_user: &User,
     state: &AppState,
     username: &str,
-) -> ResponseResult<()> {
+) -> Result<()> {
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
         Ok(None) => {
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "بررسی موجودی اشتراک فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
         Err(error) => {
             log::error!("Could not prepare panel connection for usage lookup: {error:#}");
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1529,14 +1742,21 @@ async fn send_subscription_usage(
     .await
     {
         Ok(Some(usage)) => {
-            bot.send_message(telegram_user.id, subscription_usage_message(&usage))
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &subscription_usage_message(&usage),
+                subscription_back_keyboard(),
+            )
+            .await?;
         }
         Ok(None) => {
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+            bot,
+            target,
                 "برای حساب شما اشتراکی در پنل پیدا نشد. اگر قبلاً پرداخت کرده‌اید، لطفاً با پشتیبانی تماس بگیرید.",
-            )
+            subscription_back_keyboard(),
+        )
             .await?;
         }
         Err(error) => {
@@ -1544,8 +1764,13 @@ async fn send_subscription_usage(
                 "Could not look up subscription usage for user {}: {error}",
                 telegram_user.id
             );
-            bot.send_message(telegram_user.id, error.user_message())
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &error.user_message(),
+                subscription_back_keyboard(),
+            )
+            .await?;
         }
     }
 
@@ -1554,25 +1779,30 @@ async fn send_subscription_usage(
 
 async fn send_client_subscription_link(
     bot: &Bot,
+    target: Option<CallbackMessageTarget>,
     telegram_user: &User,
     state: &AppState,
     username: &str,
-) -> ResponseResult<()> {
+) -> Result<()> {
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
         Ok(None) => {
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "دریافت لینک کانفیگ فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
         Err(error) => {
             log::error!("Could not prepare panel connection for link retrieval: {error:#}");
-            bot.send_message(
-                telegram_user.id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1589,14 +1819,14 @@ async fn send_client_subscription_link(
     {
         Ok(Some(url)) => {
             let caption = subscription_link_caption(username, &url);
-            if let Err(error) = send_subscription_qr(bot, telegram_user.id, &url, &caption).await {
+            if let Err(error) = edit_subscription_qr(bot, target, &url, &caption).await {
                 log::error!(
                     "Could not deliver subscription link for user {}: {error}",
                     telegram_user.id
                 );
-                send_user_message_with_keyboard(
+                edit_user_message_with_keyboard(
                     bot,
-                    telegram_user.id,
+                    target,
                     "ارسال لینک اشتراک با خطا روبه‌رو شد؛ لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
                     subscription_back_keyboard(),
                 )
@@ -1604,9 +1834,9 @@ async fn send_client_subscription_link(
             }
         }
         Ok(None) => {
-            send_user_message_with_keyboard(
+            edit_user_message_with_keyboard(
                 bot,
-                telegram_user.id,
+                target,
                 "این کلاینت در پنل پیدا نشد؛ فهرست را دوباره باز کنید.",
                 subscription_back_keyboard(),
             )
@@ -1617,8 +1847,13 @@ async fn send_client_subscription_link(
                 "Could not retrieve subscription link for user {}: {error}",
                 telegram_user.id
             );
-            bot.send_message(telegram_user.id, error.user_message())
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &error.user_message(),
+                subscription_back_keyboard(),
+            )
+            .await?;
         }
     }
 
@@ -1685,6 +1920,52 @@ async fn send_subscription_qr(
     Ok(())
 }
 
+async fn edit_subscription_qr(
+    bot: &Bot,
+    target: Option<CallbackMessageTarget>,
+    subscription_url: &str,
+    caption: &str,
+) -> Result<()> {
+    let target = require_callback_message_target(target)?;
+    let keyboard = subscription_back_keyboard();
+    let fallback_text = |error: &str| {
+        format!("{caption}\n\n⚠️ {error} لینک اشتراک در همین پیام به‌صورت متن ارسال شده است.")
+    };
+    match subscription_qr_png(subscription_url) {
+        Ok(image) => {
+            if let Err(error) = edit_photo_message(bot, target, image, caption, &keyboard).await {
+                log::error!(
+                    "Could not edit message to subscription QR for {}: {error:#}",
+                    target.chat_id
+                );
+                edit_text_message(
+                    bot,
+                    target,
+                    fallback_text("ارسال تصویر QR ناموفق بود."),
+                    Some("HTML"),
+                    Some(keyboard),
+                )
+                .await?;
+            }
+        }
+        Err(error) => {
+            log::error!(
+                "Could not generate subscription QR photo for {}: {error:#}",
+                target.chat_id
+            );
+            edit_text_message(
+                bot,
+                target,
+                fallback_text("ساخت تصویر QR ناموفق بود."),
+                Some("HTML"),
+                Some(keyboard),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 fn subscription_back_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
         "🏠 بازگشت به منوی اصلی",
@@ -1694,18 +1975,20 @@ fn subscription_back_keyboard() -> InlineKeyboardMarkup {
 
 async fn process_subscription_selection(
     bot: &Bot,
+    target: Option<CallbackMessageTarget>,
     telegram_user: &User,
     plan_gb: u16,
     renewal_username: Option<&str>,
     state: &AppState,
-) -> ResponseResult<()> {
+) -> Result<()> {
+    let target = require_callback_message_target(target)?;
     let telegram_user_id = telegram_user.id;
     let Some(price) = monthly_plan_price(plan_gb) else {
-        send_user_message_with_keyboard(
+        edit_user_message_with_keyboard(
             bot,
-            telegram_user_id,
+            target,
             "تعرفه‌ی انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
-            monthly_plans_keyboard(),
+            subscription_back_keyboard(),
         )
         .await?;
         return Ok(());
@@ -1725,9 +2008,11 @@ async fn process_subscription_selection(
         }
         Err(error) => {
             log::error!("Could not read payment card details: {error}");
-            bot.send_message(
-                telegram_user_id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن اطلاعات پرداخت ممکن نشد؛ لطفاً بعداً دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1735,9 +2020,11 @@ async fn process_subscription_selection(
     };
     let Some((card_number, cardholder_name)) = payment_details else {
         log::error!("Payment card configuration is missing");
-        bot.send_message(
-            telegram_user_id,
+        edit_user_message_with_keyboard(
+            bot,
+            target,
             "پرداخت در حال حاضر تنظیم نشده است. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+            subscription_back_keyboard(),
         )
         .await?;
         return Ok(());
@@ -1746,18 +2033,22 @@ async fn process_subscription_selection(
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
         Ok(None) => {
-            bot.send_message(
-                telegram_user_id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "اتصال پنل برقرار نیست و امکان ثبت سفارش وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
         Err(error) => {
             log::error!("Could not prepare panel connection for order: {error:#}");
-            bot.send_message(
-                telegram_user_id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "خواندن تنظیمات پنل انجام نشد. لطفاً بعداً دوباره تلاش کنید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1776,8 +2067,13 @@ async fn process_subscription_selection(
                 "Could not verify panel clients for user {}: {error}",
                 telegram_user_id
             );
-            bot.send_message(telegram_user_id, error.user_message())
-                .await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &error.user_message(),
+                subscription_back_keyboard(),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1787,9 +2083,11 @@ async fn process_subscription_selection(
             .iter()
             .any(|client| client.username == selected_username)
         {
-            bot.send_message(
-                telegram_user_id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "کلاینت انتخاب‌شده متعلق به حساب شما نیست یا دیگر در پنل وجود ندارد.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
@@ -1803,9 +2101,11 @@ async fn process_subscription_selection(
                     "Could not read reserved panel usernames for user {}: {error}",
                     telegram_user_id
                 );
-                bot.send_message(
-                    telegram_user_id,
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
                     "ثبت سفارش ممکن نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
                 )
                 .await?;
                 return Ok(());
@@ -1826,9 +2126,11 @@ async fn process_subscription_selection(
         {
             Ok(Some(username)) => username,
             Ok(None) => {
-                bot.send_message(
-                    telegram_user_id,
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
                     "ظرفیت ساخت نام کاربری جدید برای حساب شما تکمیل شده است؛ لطفاً با پشتیبانی تماس بگیرید.",
+                    subscription_back_keyboard(),
                 )
                 .await?;
                 return Ok(());
@@ -1838,8 +2140,13 @@ async fn process_subscription_selection(
                     "Could not choose an available username for user {}: {error}",
                     telegram_user_id
                 );
-                bot.send_message(telegram_user_id, error.user_message())
-                    .await?;
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    &error.user_message(),
+                    subscription_back_keyboard(),
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -1864,17 +2171,20 @@ async fn process_subscription_selection(
                 "Could not create payment order for Telegram user {}: {error}",
                 telegram_user_id
             );
-            bot.send_message(
-                telegram_user_id,
+            edit_user_message_with_keyboard(
+                bot,
+                target,
                 "ثبت سفارش ممکن نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
     };
 
-    bot.send_message(
-        telegram_user_id,
+    edit_text_message(
+        bot,
+        target,
         format!(
             "🧾 جزئیات سفارش\n📦 بسته: {} گیگابایت\n⏳ مدت: ۳۰ روز\n💰 مبلغ: {}\n\n💳 شماره کارت:\n(برای کپی، کافی است یک‌بار روی شماره کارت ضربه بزنید)\n\n<blockquote><code>{}</code></blockquote>\n👤 به نام: {}\n\nپس از پرداخت، عکس رسید تراکنش را همین‌جا ارسال کنید.⚠️\n فقط عکس رسید پذیرفته می‌شود.\nاگر به عکس رسید دسترسی ندارید، با آیدی پشتیبانی\n 🆔: @ipublicsupport\n در ارتباط باشید.",
             persian_digits(plan_gb),
@@ -1882,9 +2192,9 @@ async fn process_subscription_selection(
             html_escape(&card_number),
             html_escape(&cardholder_name)
         ),
+        Some("HTML"),
+        Some(payment_order_keyboard(order_id)),
     )
-    .parse_mode(ParseMode::Html)
-    .reply_markup(payment_order_keyboard(order_id))
     .await?;
 
     Ok(())
@@ -2014,7 +2324,7 @@ async fn receive_payment_receipt(
     }
 
     if let Err(error) =
-        send_rich_message(&bot, msg.chat.id, receipt_confirmation_rich_message()).await
+        send_rich_message(bot, msg.chat.id, receipt_confirmation_rich_message()).await
     {
         log::error!(
             "Could not send rich receipt confirmation to chat {}: {error:#}",
@@ -2278,9 +2588,7 @@ async fn reject_payment_order(
             if let Err(error) = bot
                 .send_message(
                     UserId(telegram_user_id),
-                    format!(
-                        "❌ رسید پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @ipublicsupport در ارتباط باشید."
-                    ),
+                    "❌ رسید پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @ipublicsupport در ارتباط باشید.",
                 )
                 .await
             {
@@ -2473,18 +2781,28 @@ fn persian_datetime(datetime: chrono::DateTime<chrono_tz::Tz>) -> String {
     persian_digits(result)
 }
 
-async fn ensure_required_channel_member(bot: &Bot, user_id: UserId) -> ResponseResult<bool> {
+async fn ensure_required_channel_member(
+    bot: &Bot,
+    target: Option<CallbackMessageTarget>,
+    user_id: UserId,
+) -> Result<bool> {
     match is_required_channel_member(bot, user_id).await {
         Ok(true) => Ok(true),
         Ok(false) => {
-            send_join_prompt(bot, user_id.into()).await?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                "برای استفاده از ربات، ابتدا در کانال ما عضو شوید و سپس «عضو شدم» را بزنید.",
+                join_channel_keyboard(),
+            )
+            .await?;
             Ok(false)
         }
         Err(error) => {
             log::error!("Could not verify channel membership for user {user_id}: {error}");
-            send_user_message_with_keyboard(
+            edit_user_message_with_keyboard(
                 bot,
-                user_id,
+                target,
                 "بررسی عضویت ممکن نشد. لطفاً بعداً دوباره تلاش کنید.",
                 join_channel_keyboard(),
             )
@@ -2826,7 +3144,7 @@ fn monthly_renewal_plans_keyboard(username: &str) -> InlineKeyboardMarkup {
     monthly_plan_keyboard(
         |gb| format!("user:renew:plan:{gb}:{username}"),
         "user:renew",
-        false,
+        true,
     )
 }
 
@@ -3036,13 +3354,23 @@ mod tests {
     }
 
     #[test]
-    fn renewal_plan_buttons_keep_their_existing_separate_labels() {
+    fn renewal_plan_buttons_match_purchase_plan_format() {
         let rows = monthly_renewal_plans_keyboard("haku-123456").inline_keyboard;
 
-        assert_eq!(rows.len(), MONTHLY_PLAN_GB.len() + 1);
+        assert_eq!(rows.len(), MONTHLY_PLAN_GB.chunks(2).len() + 1);
         assert!(rows[..rows.len() - 1].iter().all(|row| {
-            row.len() == 2 && row[0].text.starts_with("💰") && row[1].text.starts_with("📦")
+            row.len() == 2 && row.iter().all(|button| button.text.starts_with("📦"))
         }));
+        assert!(rows[..rows.len() - 1]
+            .iter()
+            .flatten()
+            .zip(MONTHLY_PLAN_GB.iter())
+            .all(|(button, gb)| {
+                button.text.contains(&format!("{} گیگ", persian_digits(gb)))
+                    && button
+                        .text
+                        .contains(&format_toman(monthly_plan_price(*gb).unwrap()))
+            }));
     }
 
     #[test]
@@ -3203,6 +3531,21 @@ mod tests {
                 if buttons[0].callback_data.as_deref() == Some("user:menu")
                     && buttons[0].style == UserMenuButtonStyle::Danger
         ));
+    }
+
+    #[test]
+    fn rich_message_edit_payload_targets_the_existing_message() {
+        let payload = serde_json::to_value(EditRichMessageRequest {
+            chat_id: 123,
+            message_id: 456,
+            rich_message: user_menu_rich_message("منو"),
+        })
+        .unwrap();
+
+        assert_eq!(payload["chat_id"], 123);
+        assert_eq!(payload["message_id"], 456);
+        assert!(payload["rich_message"]["blocks"].is_array());
+        assert!(payload.get("text").is_none());
     }
 
     #[test]

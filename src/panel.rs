@@ -421,7 +421,7 @@ fn api_url(base_url: &Url, path: &str) -> Result<Url, PanelError> {
 }
 
 fn user_url(base_url: &Url, username: &str) -> Result<Url, PanelError> {
-    let mut url = api_url(base_url, "/api/user/")?;
+    let mut url = api_url(base_url, "/api/user")?;
     url.path_segments_mut()
         .map_err(|_| PanelError::InvalidUrl)?
         .push(username);
@@ -429,7 +429,7 @@ fn user_url(base_url: &Url, username: &str) -> Result<Url, PanelError> {
 }
 
 fn user_action_url(base_url: &Url, username: &str, action: &str) -> Result<Url, PanelError> {
-    let mut url = api_url(base_url, "/api/user/")?;
+    let mut url = api_url(base_url, "/api/user")?;
     let mut segments = url
         .path_segments_mut()
         .map_err(|_| PanelError::InvalidUrl)?;
@@ -784,6 +784,22 @@ mod tests {
         assert_eq!(
             url.join("/api/admin/token").unwrap().as_str(),
             "https://panel.example.com:8443/api/admin/token"
+        );
+    }
+
+    #[test]
+    fn renewal_api_urls_support_username_routes() {
+        let base_url = normalize_panel_url("https://panel.example.com").unwrap();
+
+        assert_eq!(
+            user_url(&base_url, "haku-123456").unwrap().path(),
+            "/api/user/haku-123456"
+        );
+        assert_eq!(
+            user_action_url(&base_url, "haku-123456", "reset")
+                .unwrap()
+                .path(),
+            "/api/user/haku-123456/reset"
         );
     }
 
