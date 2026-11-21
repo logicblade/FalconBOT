@@ -1,0 +1,23 @@
+[package]
+name = "foxngbot-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+chrono-tz = "0.10"
+dotenvy = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
+log = { version = "0.4", features = ["std"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+teloxide = { version = "0.17", features = ["ctrlc_handler"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+zeroize = "1"
