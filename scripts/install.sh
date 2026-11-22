@@ -76,13 +76,17 @@ install -d -o "${SERVICE_USER}" -g "${SERVICE_USER}" -m 0750 \
     "${DATA_DIR}" "${LOG_DIR}"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
+    exec 3</dev/tty || fail "Interactive installation requires a terminal."
+
     printf 'Telegram bot token: ' >&2
-    IFS= read -r -s BOT_TOKEN
+    IFS= read -r -s -u 3 BOT_TOKEN || fail "Could not read the Telegram bot token."
     printf '\n' >&2
     [[ "${BOT_TOKEN}" =~ ^[0-9]{6,}:[A-Za-z0-9_-]{20,}$ ]] \
         || fail "The bot token format is invalid."
 
-    read -r -p "Owner Telegram user ID: " OWNER_ID
+    read -r -p "Owner Telegram user ID: " -u 3 OWNER_ID \
+        || fail "Could not read the owner Telegram user ID."
+    exec 3<&-
     [[ "${OWNER_ID}" =~ ^[1-9][0-9]*$ ]] \
         || fail "OWNER_ID must be a positive numeric Telegram ID."
 
