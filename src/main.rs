@@ -2,34 +2,43 @@ mod panel;
 mod state;
 
 use anyhow::{anyhow, Context, Result};
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
-use state::{AppState, NewTariffPaymentOrder, PaymentOrder, SetupState, SubscriptionTariff};
+use state::{
+    AppState, BotUserDetails, BotUserSearchResult, CreateTariffPaymentOrderError, DiskSpaceUsage,
+    FinancialStatistics, NewTariffPaymentOrder, PaymentOrder, RequiredChannel, SetupState,
+    SubscriptionTariff, WalletBulkAction, WalletBulkAdjustmentSummary, MAX_REQUIRED_CHANNELS,
+};
 use std::{
     env,
     fs::{self, OpenOptions},
     io::{self, Cursor, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use teloxide::{
     dispatching::UpdateFilterExt,
     dptree,
+    net::Download,
     prelude::*,
     types::{
         CopyTextButton, FileId, InlineKeyboardButton, InlineKeyboardButtonKind,
         InlineKeyboardMarkup, InputFile, MessageId, ParseMode, Update, User,
     },
 };
+use tokio::io::AsyncWriteExt;
 use url::Url;
 use zeroize::Zeroizing;
 
-const REQUIRED_CHANNEL: &str = "@HakuNGVPN";
-const REQUIRED_CHANNEL_URL: &str = "https://t.me/HakuNGVPN";
 const USER_MENU_PROMPT: &str = "از منوی زیر انتخاب کن 👇🏻";
+const MAX_DATABASE_BACKUP_SIZE: u64 = 20 * 1024 * 1024;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn start_user_menu_prompt(first_name: &str) -> String {
     let name = first_name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -593,6 +602,14 @@ async fn main() -> Result<()> {
         log::warn!("Telegram did not return a bot username; referral links will be unavailable");
     }
 
+    tokio::spawn(schedule_daily_database_backups(
+        bot.clone(),
+        Arc::clone(&state),
+    ));
+    tokio::spawn(schedule_daily_disk_space_checks(
+        bot.clone(),
+        Arc::clone(&state),
+    ));
     log::info!("FOXNG Rust bot started");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
@@ -607,6 +624,129 @@ async fn main() -> Result<()> {
 fn required_env(name: &str) -> Result<String> {
     let value = env::var(name).with_context(|| format!("Set {name} in the environment or .env"))?;
     Ok(value.trim().to_owned())
+}
+
+fn duration_until_next_iran_time(
+    now: chrono::DateTime<Utc>,
+    hour: u32,
+    minute: u32,
+) -> Result<std::time::Duration> {
+    if hour > 23 || minute > 59 {
+        return Err(anyhow!("Iran scheduler time is out of range"));
+    }
+    let iran_now = now.with_timezone(&chrono_tz::Asia::Tehran);
+    let target_today = iran_now
+        .date_naive()
+        .and_hms_opt(hour, minute, 0)
+        .context("Could not construct scheduled time in the Iran timezone")?;
+    let mut next_run = chrono_tz::Asia::Tehran
+        .from_local_datetime(&target_today)
+        .single()
+        .context("Scheduled time is ambiguous or invalid in the Iran timezone")?;
+    if next_run <= iran_now {
+        let next_date = iran_now
+            .date_naive()
+            .succ_opt()
+            .context("Could not calculate the next Iran calendar date")?;
+        let target_tomorrow = next_date
+            .and_hms_opt(hour, minute, 0)
+            .context("Could not construct next scheduled time in the Iran timezone")?;
+        next_run = chrono_tz::Asia::Tehran
+            .from_local_datetime(&target_tomorrow)
+            .single()
+            .context("Next scheduled time is ambiguous or invalid in the Iran timezone")?;
+    }
+    next_run
+        .with_timezone(&Utc)
+        .signed_duration_since(now)
+        .to_std()
+        .context("Next Iran scheduled time is not in the future")
+}
+
+fn duration_until_next_iran_midnight(now: chrono::DateTime<Utc>) -> Result<std::time::Duration> {
+    duration_until_next_iran_time(now, 0, 0)
+}
+
+async fn schedule_daily_database_backups(bot: Bot, state: Arc<AppState>) {
+    loop {
+        let delay = match duration_until_next_iran_midnight(Utc::now()) {
+            Ok(delay) => delay,
+            Err(error) => {
+                log::error!("Could not schedule the next daily database backup: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+        tokio::time::sleep(delay).await;
+
+        if let Err(error) = send_database_backup(
+            &bot,
+            state.owner_id,
+            &state,
+            "🌙 بکاپ روزانه دیتابیس — ساعت ۰۰:۰۰ به وقت ایران",
+        )
+        .await
+        {
+            log::error!("Could not send scheduled database backup: {error}");
+            if let Err(notification_error) = bot
+                .send_message(
+                    state.owner_id,
+                    "⚠️ ارسال بکاپ شبانه‌ی دیتابیس انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                )
+                .await
+            {
+                log::error!(
+                    "Could not notify the owner about the failed database backup: {notification_error}"
+                );
+            }
+        }
+    }
+}
+
+async fn schedule_daily_disk_space_checks(bot: Bot, state: Arc<AppState>) {
+    loop {
+        let delay = match duration_until_next_iran_time(Utc::now(), 15, 0) {
+            Ok(delay) => delay,
+            Err(error) => {
+                log::error!("Could not schedule the next daily disk-space check: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+        tokio::time::sleep(delay).await;
+
+        match state.disk_space_usage() {
+            Ok(usage) if disk_space_below_alert_threshold(usage) => {
+                let free_percent = usage.free_bytes as f64 * 100.0 / usage.total_bytes as f64;
+                let message = format!(
+                    "⚠️ هشدار کمبود فضای دیسک سرور\n\n🟢 فضای خالی: {}\n💽 ظرفیت کل: {}\n📊 درصد فضای خالی: {}٪\n⛔ آستانه هشدار: کمتر از ۱۵٪",
+                    format_disk_space(usage.free_bytes),
+                    format_disk_space(usage.total_bytes),
+                    persian_digits(format!("{free_percent:.2}"))
+                );
+                let mut recipients = vec![state.owner_id.0];
+                match state.admins() {
+                    Ok(admins) => recipients.extend(admins),
+                    Err(error) => {
+                        log::error!("Could not load admins for disk-space warning: {error}");
+                    }
+                }
+                recipients.sort_unstable();
+                recipients.dedup();
+                for recipient in recipients {
+                    if let Err(error) = bot.send_message(UserId(recipient), message.clone()).await {
+                        log::error!(
+                            "Could not send low disk-space warning to user {recipient}: {error}"
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::error!("Could not read server disk-space usage: {error}");
+            }
+        }
+    }
 }
 
 fn is_start_command(text: &str) -> bool {
@@ -691,6 +831,19 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
     let Some(sender) = msg.from.as_ref() else {
         return Ok(());
     };
+    let is_start_message = msg.text().is_some_and(is_start_command);
+    if msg.chat.is_private() && !is_start_message {
+        if let Err(error) = state.update_bot_user_profile(
+            sender.id.0,
+            sender.username.as_deref(),
+            &sender.first_name,
+        ) {
+            log::error!(
+                "Could not update profile for bot user {}: {error}",
+                sender.id
+            );
+        }
+    }
     let is_owner = sender.id == state.owner_id;
     let is_admin = if is_owner {
         false
@@ -707,6 +860,27 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
         }
     };
     let Some(text) = msg.text() else {
+        if is_owner {
+            if let Some(document) = msg.document() {
+                match state.take_setup(sender.id) {
+                    Some(SetupState::DatabaseRestore) => {
+                        if !msg.chat.is_private() {
+                            state.set_setup(sender.id, SetupState::DatabaseRestore);
+                            bot.send_message(
+                                msg.chat.id,
+                                "برای حفظ امنیت، فایل بکاپ را فقط در گفت‌وگوی خصوصی با ربات ارسال کنید.",
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        restore_database_backup(&bot, sender.id, &msg, &state, document).await?;
+                        return Ok(());
+                    }
+                    Some(setup) => state.set_setup(sender.id, setup),
+                    None => {}
+                }
+            }
+        }
         if !is_owner && !is_admin {
             match state.awaiting_receipt_order(sender.id.0) {
                 Ok(Some(order_id)) => {
@@ -747,11 +921,25 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
         return Ok(());
     };
 
-    if is_start_command(text) {
+    if is_start_message {
         if msg.chat.is_private() {
             let referrer_id = start_referrer_id(text);
-            if let Err(error) = state.record_bot_user_with_referrer(sender.id.0, referrer_id) {
-                log::error!("Could not record bot user {}: {error}", sender.id);
+            match state.record_bot_user_with_referrer(sender.id.0, referrer_id) {
+                Ok(()) => {
+                    if let Err(error) = state.update_bot_user_profile(
+                        sender.id.0,
+                        sender.username.as_deref(),
+                        &sender.first_name,
+                    ) {
+                        log::error!(
+                            "Could not update profile for bot user {}: {error}",
+                            sender.id
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::error!("Could not record bot user {}: {error}", sender.id);
+                }
             }
         }
         state.cancel_setup(sender.id);
@@ -772,13 +960,13 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
             .await?;
         } else {
             log::info!("User {} opened the start menu", sender.id);
-            match is_required_channel_member(&bot, sender.id).await {
+            match is_required_channel_member(&bot, &state, sender.id).await {
                 Ok(true) => {
                     let prompt = start_user_menu_prompt(&sender.first_name);
                     send_user_menu(&bot, msg.chat.id, &prompt).await?;
                 }
                 Ok(false) => {
-                    send_join_prompt(&bot, msg.chat.id).await?;
+                    send_join_prompt(&bot, msg.chat.id, &state).await?;
                 }
                 Err(error) => {
                     log::error!(
@@ -789,7 +977,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                         &bot,
                         msg.chat.id,
                         "برای بررسی عضویت، ربات باید در کانال دسترسی مدیر داشته باشد. لطفاً بعداً دوباره تلاش کنید.",
-                        join_channel_keyboard(),
+                        required_channel_join_keyboard(&state)?,
                     )
                     .await?;
                 }
@@ -814,7 +1002,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                 );
                 bot.send_message(
                     msg.chat.id,
-                    "لغو سفارش انجام نشد؛ لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                    format!(
+                        "لغو سفارش انجام نشد؛ لطفاً دوباره تلاش کنید یا با پشتیبانی @{} تماس بگیرید.",
+                        state.support_username()
+                    ),
                 )
                 .await?;
             }
@@ -855,6 +1046,25 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
     let Some(step) = state.take_setup(sender.id) else {
         return Ok(());
     };
+    if is_owner
+        && !msg.chat.is_private()
+        && matches!(
+            &step,
+            SetupState::WalletUserId
+                | SetupState::WalletBalance { .. }
+                | SetupState::WalletReason { .. }
+                | SetupState::WalletBulkAmount { .. }
+                | SetupState::WalletBulkReason { .. }
+        )
+    {
+        state.set_setup(sender.id, step);
+        bot.send_message(
+            msg.chat.id,
+            "برای حفظ حریم خصوصی، مدیریت کیف پول را فقط در گفت‌وگوی خصوصی با ربات انجام دهید.",
+        )
+        .await?;
+        return Ok(());
+    }
     match step {
         SetupState::AdminId => {
             let admin_id = text.trim().parse::<u64>().ok().filter(|id| *id > 0);
@@ -938,37 +1148,20 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
             }
         }
         SetupState::WalletBalance { user_id } => match parse_management_signed_number(text) {
-            Some(target_balance) => match state.set_wallet_balance(user_id, target_balance) {
-                Ok(previous_balance) => {
-                    log::info!(
-                        "Owner {} set wallet balance for user {} from {} to {} toman",
-                        sender.id,
+            Some(target_balance) => {
+                state.set_setup(
+                    sender.id,
+                    SetupState::WalletReason {
                         user_id,
-                        previous_balance,
-                        target_balance
-                    );
-                    bot.send_message(
-                        msg.chat.id,
-                        format!(
-                            "✅ موجودی کاربر {} تغییر کرد.\nموجودی قبلی: {}\nموجودی جدید: {}",
-                            persian_digits(user_id),
-                            format_signed_toman(previous_balance),
-                            format_signed_toman(target_balance)
-                        ),
-                    )
-                    .reply_markup(owner_keyboard())
-                    .await?;
-                }
-                Err(error) => {
-                    log::error!("Could not set wallet balance for user {user_id}: {error}");
-                    state.set_setup(sender.id, SetupState::WalletBalance { user_id });
-                    bot.send_message(
-                            msg.chat.id,
-                            "ذخیره‌ی موجودی انجام نشد؛ مبلغ نهایی را دوباره وارد کنید یا /cancel را بزنید.",
-                        )
-                        .await?;
-                }
-            },
+                        target_balance,
+                    },
+                );
+                bot.send_message(
+                    msg.chat.id,
+                    "دلیل تغییر موجودی را بنویسید (حداکثر ۵۰۰ نویسه). برای لغو /cancel را بزنید.",
+                )
+                .await?;
+            }
             None => {
                 state.set_setup(sender.id, SetupState::WalletBalance { user_id });
                 bot.send_message(
@@ -978,6 +1171,283 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                     .await?;
             }
         },
+        SetupState::WalletReason {
+            user_id,
+            target_balance,
+        } => {
+            let reason = text.trim();
+            if reason.is_empty() || reason.chars().count() > 500 {
+                state.set_setup(
+                    sender.id,
+                    SetupState::WalletReason {
+                        user_id,
+                        target_balance,
+                    },
+                );
+                bot.send_message(
+                    msg.chat.id,
+                    "دلیل نباید خالی و باید حداکثر ۵۰۰ نویسه باشد؛ دوباره بفرستید یا /cancel را بزنید.",
+                )
+                .await?;
+            } else {
+                match state.set_wallet_balance_with_reason(user_id, target_balance, reason) {
+                    Ok(previous_balance) => {
+                        log::info!(
+                            "Owner {} set wallet balance for user {} from {} to {} toman",
+                            sender.id,
+                            user_id,
+                            previous_balance,
+                            target_balance
+                        );
+                        send_text_message_with_keyboard(
+                            &bot,
+                            msg.chat.id,
+                            format!(
+                                "✅ موجودی کاربر {} تغییر کرد.\nموجودی قبلی: {}\nموجودی جدید: {}\n📝 دلیل: {}",
+                                persian_digits(user_id),
+                                format_signed_toman(previous_balance),
+                                format_signed_toman(target_balance),
+                                reason
+                            ),
+                            wallet_management_keyboard(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not set wallet balance for user {user_id}: {error}");
+                        state.set_setup(
+                            sender.id,
+                            SetupState::WalletReason {
+                                user_id,
+                                target_balance,
+                            },
+                        );
+                        bot.send_message(
+                            msg.chat.id,
+                            "ذخیره‌ی تغییر موجودی انجام نشد؛ دلیل را دوباره وارد کنید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+        SetupState::WalletBulkAmount { action } => {
+            match parse_management_number(text).and_then(|amount| i64::try_from(amount).ok()) {
+                Some(amount_toman) if amount_toman > 0 => {
+                    state.set_setup(
+                        sender.id,
+                        SetupState::WalletBulkReason {
+                            action,
+                            amount_toman,
+                        },
+                    );
+                    bot.send_message(
+                            msg.chat.id,
+                            "دلیل این تغییر گروهی را وارد کنید (حداکثر ۵۰۰ نویسه). برای لغو /cancel را بزنید.",
+                        )
+                        .await?;
+                }
+                _ => {
+                    state.set_setup(sender.id, SetupState::WalletBulkAmount { action });
+                    bot.send_message(
+                            msg.chat.id,
+                            "مبلغ باید عدد صحیحی بزرگ‌تر از صفر باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                }
+            }
+        }
+        SetupState::WalletBulkReason {
+            action,
+            amount_toman,
+        } => {
+            let reason = text.trim();
+            if reason.is_empty() || reason.chars().count() > 500 {
+                state.set_setup(
+                    sender.id,
+                    SetupState::WalletBulkReason {
+                        action,
+                        amount_toman,
+                    },
+                );
+                bot.send_message(
+                        msg.chat.id,
+                        "دلیل نباید خالی و باید حداکثر ۵۰۰ نویسه باشد؛ دوباره بفرستید یا /cancel را بزنید.",
+                    )
+                    .await?;
+            } else {
+                match state.adjust_all_wallets(action, amount_toman, reason) {
+                    Ok(summary) => {
+                        log::info!(
+                                "Owner {} performed a bulk {:?} wallet adjustment of {} toman for {} users",
+                                sender.id,
+                                action,
+                                amount_toman,
+                                summary.targeted_users
+                            );
+                        send_text_message_with_keyboard(
+                            &bot,
+                            msg.chat.id,
+                            bulk_wallet_adjustment_message(action, amount_toman, reason, summary),
+                            wallet_management_keyboard(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not apply bulk wallet adjustment: {error}");
+                        state.set_setup(
+                            sender.id,
+                            SetupState::WalletBulkReason {
+                                action,
+                                amount_toman,
+                            },
+                        );
+                        bot.send_message(
+                                msg.chat.id,
+                                "تغییر گروهی موجودی انجام نشد و هیچ کیف پولی تغییر نکرد؛ دلیل را دوباره بفرستید یا /cancel را بزنید.",
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+        SetupState::ReferralPercent => {
+            match parse_management_number(text).and_then(|percent| u8::try_from(percent).ok()) {
+                Some(percent) if percent <= 100 => match state.set_referral_percent(percent) {
+                    Ok(()) => {
+                        log::info!(
+                            "Owner {} set referral commission rate to {}%",
+                            sender.id,
+                            percent
+                        );
+                        send_referral_management(&bot, sender.id, &state).await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not update referral commission rate: {error}");
+                        state.set_setup(sender.id, SetupState::ReferralPercent);
+                        bot.send_message(
+                                    msg.chat.id,
+                                    "ذخیره‌ی درصد پورسانت انجام نشد؛ دوباره عددی بین ۰ تا ۱۰۰ وارد کنید یا /cancel را بزنید.",
+                                )
+                                .await?;
+                    }
+                },
+                _ => {
+                    state.set_setup(sender.id, SetupState::ReferralPercent);
+                    bot.send_message(
+                            msg.chat.id,
+                            "درصد پورسانت باید عدد صحیحی بین ۰ تا ۱۰۰ باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                }
+            }
+        }
+        SetupState::SupportId => {
+            if !msg.chat.is_private() {
+                state.set_setup(sender.id, SetupState::SupportId);
+                bot.send_message(
+                    msg.chat.id,
+                    "برای حفظ امنیت، تغییر آیدی پشتیبان را فقط در گفت‌وگوی خصوصی با ربات انجام دهید.",
+                )
+                .await?;
+            } else if let Some(support_username) = normalize_support_username(text) {
+                match state.set_support_username(&support_username) {
+                    Ok(()) => {
+                        log::info!(
+                            "Owner {} changed the support username to @{}",
+                            sender.id,
+                            support_username
+                        );
+                        send_text_message_with_keyboard(
+                            &bot,
+                            msg.chat.id,
+                            format!("✅ آیدی پشتیبان به @{support_username} تغییر کرد."),
+                            owner_keyboard(),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not update the support username: {error}");
+                        state.set_setup(sender.id, SetupState::SupportId);
+                        bot.send_message(
+                            msg.chat.id,
+                            "ذخیره‌ی آیدی پشتیبان انجام نشد؛ دوباره یوزرنیم را بفرستید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                state.set_setup(sender.id, SetupState::SupportId);
+                bot.send_message(
+                    msg.chat.id,
+                    "یوزرنیم تلگرام باید ۵ تا ۳۲ نویسه و شامل حروف انگلیسی، عدد یا _ باشد. با یا بدون @ بفرستید یا /cancel را بزنید.",
+                )
+                .await?;
+            }
+        }
+        SetupState::RequiredChannelUsername => {
+            if !msg.chat.is_private() {
+                state.set_setup(sender.id, SetupState::RequiredChannelUsername);
+                bot.send_message(
+                    msg.chat.id,
+                    "برای حفظ امنیت، مدیریت کانال‌های اجباری را فقط در گفت‌وگوی خصوصی با ربات انجام دهید.",
+                )
+                .await?;
+            } else if let Some(username) = state::normalize_required_channel_username(text) {
+                match state.add_required_channel(&username) {
+                    Ok(true) => {
+                        log::info!("Owner {} added required channel @{}", sender.id, username);
+                        send_required_channel_management(&bot, sender.id, &state).await?;
+                    }
+                    Ok(false) => {
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("کانال @{username} از قبل در فهرست است."),
+                        )
+                        .await?;
+                        send_required_channel_management(&bot, sender.id, &state).await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not add required channel @{username}: {error}");
+                        state.set_setup(sender.id, SetupState::RequiredChannelUsername);
+                        bot.send_message(
+                            msg.chat.id,
+                            format!(
+                                "افزودن کانال انجام نشد. حداکثر {MAX_REQUIRED_CHANNELS} کانال قابل ثبت است؛ یوزرنیم را دوباره بفرستید یا /cancel را بزنید."
+                            ),
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                state.set_setup(sender.id, SetupState::RequiredChannelUsername);
+                bot.send_message(
+                    msg.chat.id,
+                    "یوزرنیم عمومی کانال را با یا بدون @ بفرستید؛ باید ۵ تا ۳۲ نویسه و شامل حروف انگلیسی، عدد یا _ باشد. برای لغو /cancel را بزنید.",
+                )
+                .await?;
+            }
+        }
+        SetupState::DatabaseRestore => {
+            state.set_setup(sender.id, SetupState::DatabaseRestore);
+            bot.send_message(
+                msg.chat.id,
+                "لطفاً فایل بکاپی را که همین ربات برای شما فرستاده، به‌صورت فایل (Document) ارسال کنید یا /cancel را بزنید.",
+            )
+            .await?;
+        }
+        SetupState::UserSearch => {
+            if !msg.chat.is_private() {
+                state.set_setup(sender.id, SetupState::UserSearch);
+                bot.send_message(
+                    msg.chat.id,
+                    "برای حفظ حریم خصوصی، جستجوی کاربران را فقط در گفت‌وگوی خصوصی با ربات انجام دهید.",
+                )
+                .await?;
+            } else {
+                send_user_search_results(&bot, sender.id, &state, text).await?;
+            }
+        }
         SetupState::BroadcastAll => {
             broadcast_message(&bot, &msg, &state, false).await?;
         }
@@ -1369,6 +1839,23 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
         .await?;
         return Ok(());
     }
+    if is_owner
+        && (data.starts_with("owner:database:")
+            || data.starts_with("owner:users:")
+            || data.starts_with("owner:wallet:")
+            || data.starts_with("owner:finance:")
+            || data.starts_with("owner:disk:")
+            || data.starts_with("owner:support:")
+            || data.starts_with("owner:channels:"))
+        && !target.is_some_and(|target| target.chat_id.0 == query.from.id.0 as i64)
+    {
+        bot.send_message(
+            query.from.id,
+            "برای حفظ حریم خصوصی، این بخش فقط در گفت‌وگوی خصوصی با ربات در دسترس است.",
+        )
+        .await?;
+        return Ok(());
+    }
 
     let is_purchase_action = data == "user:buy"
         || data == "user:plans:month"
@@ -1459,11 +1946,137 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             )
             .await?;
         }
+        "owner:support:set" if is_owner => {
+            state.set_setup(query.from.id, SetupState::SupportId);
+            bot.send_message(
+                query.from.id,
+                format!(
+                    "آیدی فعلی پشتیبان: @{}\nیوزرنیم جدید تلگرام را با یا بدون @ بفرستید. برای لغو /cancel را بزنید.",
+                    state.support_username()
+                ),
+            )
+            .await?;
+        }
+        "owner:channels:manage" if is_owner => {
+            send_required_channel_management(&bot, query.from.id, &state).await?;
+        }
+        "owner:channels:add" if is_owner => {
+            state.set_setup(query.from.id, SetupState::RequiredChannelUsername);
+            bot.send_message(
+                query.from.id,
+                format!(
+                    "یوزرنیم عمومی کانال را با یا بدون @ بفرستید. ربات باید در کانال ادمین باشد تا عضویت کاربران را بررسی کند. حداکثر {MAX_REQUIRED_CHANNELS} کانال قابل ثبت است. برای لغو /cancel را بزنید."
+                ),
+            )
+            .await?;
+        }
+        "owner:channels:toggle" if is_owner => match state.required_channels_enabled() {
+            Ok(enabled) => match state.set_required_channels_enabled(!enabled) {
+                Ok(()) => {
+                    log::info!(
+                        "Owner {} {} required channel membership",
+                        query.from.id,
+                        if enabled { "disabled" } else { "enabled" }
+                    );
+                    send_required_channel_management(&bot, query.from.id, &state).await?;
+                }
+                Err(error) => {
+                    log::error!("Could not toggle required channel membership: {error}");
+                    bot.send_message(
+                        query.from.id,
+                        "ذخیره وضعیت عضویت اجباری انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                    )
+                    .await?;
+                }
+            },
+            Err(error) => {
+                log::error!("Could not read required channel status: {error}");
+                bot.send_message(
+                    query.from.id,
+                    "خواندن وضعیت عضویت اجباری انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                )
+                .await?;
+            }
+        },
+        data if data.starts_with("owner:channels:remove:") && is_owner => {
+            let username = data
+                .strip_prefix("owner:channels:remove:")
+                .unwrap_or_default();
+            match state.remove_required_channel(username) {
+                Ok(true) => {
+                    log::info!(
+                        "Owner {} removed required channel @{}",
+                        query.from.id,
+                        username
+                    );
+                    send_required_channel_management(&bot, query.from.id, &state).await?;
+                }
+                Ok(false) => {
+                    bot.send_message(query.from.id, "این کانال در فهرست پیدا نشد.")
+                        .await?;
+                    send_required_channel_management(&bot, query.from.id, &state).await?;
+                }
+                Err(error) => {
+                    log::error!("Could not remove required channel @{username}: {error}");
+                    bot.send_message(
+                        query.from.id,
+                        "حذف کانال انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                    )
+                    .await?;
+                }
+            }
+        }
         "owner:wallet:manage" if is_owner => {
+            send_wallet_management(&bot, query.from.id, &state).await?;
+        }
+        "owner:disk:manage" if is_owner => {
+            send_disk_space_management(&bot, query.from.id, &state).await?;
+        }
+        "owner:finance:manage" if is_owner => {
+            send_financial_statistics_menu(&bot, query.from.id).await?;
+        }
+        data if data.starts_with("owner:finance:") && is_owner => {
+            match financial_metric_from_callback(data) {
+                Some(metric) => {
+                    send_financial_statistic(&bot, query.from.id, &state, metric).await?;
+                }
+                None => {
+                    bot.send_message(query.from.id, "گزینه‌ی آمار مالی معتبر نیست.")
+                        .await?;
+                }
+            }
+        }
+        "owner:wallet:adjust" if is_owner => {
             state.set_setup(query.from.id, SetupState::WalletUserId);
             bot.send_message(
                 query.from.id,
                 "شناسه‌ی عددی تلگرام کاربر را ارسال کنید تا موجودی کیف پول او را تنظیم کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        "owner:wallet:increase_all" if is_owner => {
+            state.set_setup(
+                query.from.id,
+                SetupState::WalletBulkAmount {
+                    action: WalletBulkAction::Increase,
+                },
+            );
+            bot.send_message(
+                query.from.id,
+                "مبلغ هدیه برای هر کاربر را به تومان وارد کنید (عدد صحیح بزرگ‌تر از صفر). سپس دلیل تغییر ثبت می‌شود. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        "owner:wallet:decrease_all" if is_owner => {
+            state.set_setup(
+                query.from.id,
+                SetupState::WalletBulkAmount {
+                    action: WalletBulkAction::Decrease,
+                },
+            );
+            bot.send_message(
+                query.from.id,
+                "مبلغ کسر از هر کاربر را به تومان وارد کنید. اگر موجودی کمتر باشد، فقط تا صفر کسر می‌شود و موجودی رزروشده‌ی سفارش‌های باز حفظ می‌شود. سپس دلیل تغییر ثبت می‌شود. برای لغو /cancel را بزنید.",
             )
             .await?;
         }
@@ -1482,6 +2095,62 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
         }
         "owner:sales:renewal:enable" if is_owner => {
             update_sales_feature(&bot, query.from.id, &state, SalesFeature::Renewal, true).await?;
+        }
+        "owner:referral:manage" if is_owner => {
+            send_referral_management(&bot, query.from.id, &state).await?;
+        }
+        "owner:referral:disable" if is_owner => {
+            update_referrals_enabled(&bot, query.from.id, &state, false).await?;
+        }
+        "owner:referral:enable" if is_owner => {
+            update_referrals_enabled(&bot, query.from.id, &state, true).await?;
+        }
+        "owner:referral:percent" if is_owner => {
+            state.set_setup(query.from.id, SetupState::ReferralPercent);
+            bot.send_message(
+                query.from.id,
+                "درصد پورسانت را به‌صورت عدد صحیح بین ۰ تا ۱۰۰ ارسال کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        "owner:database:manage" if is_owner => {
+            send_database_management(&bot, query.from.id).await?;
+        }
+        "owner:database:backup" if is_owner => {
+            send_database_backup(&bot, query.from.id, &state, "✅ بکاپ دیتابیس ربات").await?;
+        }
+        "owner:database:restore" if is_owner => {
+            state.set_setup(query.from.id, SetupState::DatabaseRestore);
+            bot.send_message(
+                query.from.id,
+                "برای ریستور، همان فایل بکاپی را که قبلاً همین ربات برای شما فرستاده، بدون تغییر به‌صورت فایل (Document) در همین گفت‌وگو ارسال کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        "owner:users:manage" if is_owner => {
+            send_user_management_menu(&bot, query.from.id, &state).await?;
+        }
+        "owner:users:search" if is_owner => {
+            state.set_setup(query.from.id, SetupState::UserSearch);
+            bot.send_message(
+                query.from.id,
+                "شناسه‌ی عددی تلگرام یا نام کاربری کاربر را (با یا بدون @) ارسال کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        data if data.starts_with("owner:users:item:") && is_owner => {
+            let user_id = data
+                .strip_prefix("owner:users:item:")
+                .and_then(|value| value.parse::<u64>().ok());
+            match user_id {
+                Some(user_id) => {
+                    send_managed_user_details(&bot, query.from.id, &state, user_id).await?;
+                }
+                None => {
+                    bot.send_message(query.from.id, "شناسه‌ی کاربر معتبر نیست.")
+                        .await?;
+                }
+            }
         }
         "owner:tariffs:manage" if is_owner => {
             send_subscription_tariffs(&bot, query.from.id, &state).await?;
@@ -1689,7 +2358,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 .await?;
         }
         "user:purchase-menu" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             edit_user_message_with_keyboard(
@@ -1701,7 +2372,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             .await?;
         }
         "user:management-menu" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             edit_user_message_with_keyboard(
@@ -1713,9 +2386,35 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             .await?;
         }
         "user:referral" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
+            let referral_percent = match state.referral_status() {
+                Ok((true, percent)) => percent,
+                Ok((false, _)) => {
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "قابلیت زیرمجموعه‌گیری در حال حاضر غیرفعال است.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::error!("Could not read referral settings: {error}");
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "خواندن وضعیت زیرمجموعه‌گیری ممکن نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
             let Some(username) = state.bot_username() else {
                 log::error!("Bot username is unavailable for referral-link generation");
                 edit_user_message_with_keyboard(
@@ -1730,7 +2429,7 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             match state.referral_summary(query.from.id.0) {
                 Ok((referrals, commissions)) => {
                     let link = format!("https://t.me/{username}?start=ref_{}", query.from.id.0);
-                    let body = referral_message(&link, referrals, commissions);
+                    let body = referral_message(&link, referrals, commissions, referral_percent);
                     edit_user_message_with_keyboard(&bot, target, &body, referral_keyboard(&link))
                         .await?;
                 }
@@ -1750,7 +2449,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             }
         }
         "user:wallet" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             match state.wallet_summary(query.from.id.0) {
@@ -1776,7 +2477,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             }
         }
         data if data.starts_with("payment:cancel:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let order_id = data
@@ -1805,14 +2508,19 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                     send_user_menu(
                         &bot,
                         query.from.id,
-                        "به صفحه‌ی اصلی برگشتید؛ لغو سفارش در انتظار رسید انجام نشد. برای پیگیری با پشتیبانی تماس بگیرید.",
+                        &format!(
+                            "به صفحه‌ی اصلی برگشتید؛ لغو سفارش در انتظار رسید انجام نشد. برای پیگیری با پشتیبانی @{} تماس بگیرید.",
+                            state.support_username()
+                        ),
                     )
                     .await?;
                 }
             }
         }
         "user:buy" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             edit_user_message_with_keyboard(
@@ -1824,7 +2532,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             .await?;
         }
         "user:renew" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             send_panel_client_choices(
@@ -1837,14 +2547,18 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             .await?;
         }
         data if data.starts_with("user:renew:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let username = data.strip_prefix("user:renew:select:").unwrap_or_default();
             send_renewal_plans(&bot, target, &query.from, &state, username).await?;
         }
         data if data.starts_with("user:renew:plan:id:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let selection = data.strip_prefix("user:renew:plan:id:").unwrap_or_default();
@@ -1890,7 +2604,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             }
         }
         "user:plans:month" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             match state.active_subscription_tariffs() {
@@ -1907,7 +2623,7 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                     edit_user_message_with_keyboard(
                         &bot,
                         target,
-                        "پلن خریدتو انتخاب کن 👇",
+                        "✨ تمام سرویس‌ها بدون محدودیت کاربر و دارای تانل‌های نیم‌بها هستند! 🚀\n\nپلن خریدتو انتخاب کن 👇",
                         monthly_plans_keyboard(&tariffs),
                     )
                     .await?;
@@ -1925,7 +2641,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             }
         }
         "user:main" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             if let Err(error) = state.cancel_awaiting_order(query.from.id.0) {
@@ -1937,45 +2655,56 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             send_user_menu(&bot, query.from.id, USER_MENU_PROMPT).await?;
         }
         "user:menu" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             send_user_menu(&bot, query.from.id, USER_MENU_PROMPT).await?;
         }
         "user:usage" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             send_panel_client_choices(&bot, target, &query.from, &state, ClientListPurpose::Usage)
                 .await?;
         }
         "user:link" => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             send_panel_client_choices(&bot, target, &query.from, &state, ClientListPurpose::Link)
                 .await?;
         }
         data if data.starts_with("user:usage:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let username = data.strip_prefix("user:usage:select:").unwrap_or_default();
             send_subscription_usage(&bot, target, &query.from, &state, username).await?;
         }
         data if data.starts_with("user:link:select:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let username = data.strip_prefix("user:link:select:").unwrap_or_default();
             send_client_subscription_link(&bot, target, &query.from, &state, username).await?;
         }
         "user:support" => {
+            let support_username = state.support_username();
             edit_user_message_with_keyboard(
                 &bot,
                 target,
-                "برای ارتباط با پشتیبانی از دکمه زیر استفاده کن 👇🏼",
-                support_keyboard(),
+                &format!("برای ارتباط با پشتیبانی @{support_username} از دکمه زیر استفاده کن 👇🏼"),
+                support_keyboard(&support_username),
             )
             .await?;
         }
@@ -1984,7 +2713,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             || data.starts_with("user:rc:")
             || data.starts_with("user:rw:") =>
         {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let Some((tariff_id, renewal_username, use_wallet)) =
@@ -2069,7 +2800,9 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             }
         }
         data if data.starts_with("user:plan:id:") => {
-            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+            if !is_owner
+                && !ensure_required_channel_member(&bot, &state, target, query.from.id).await?
+            {
                 return Ok(());
             }
             let tariff_id = data
@@ -2145,7 +2878,7 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 },
             }
         }
-        "user:join:check" => match is_required_channel_member(&bot, query.from.id).await {
+        "user:join:check" => match is_required_channel_member(&bot, &state, query.from.id).await {
             Ok(true) => {
                 log::info!("User {} joined the required channel", query.from.id);
                 let prompt = start_user_menu_prompt(&query.from.first_name);
@@ -2155,8 +2888,8 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 edit_user_message_with_keyboard(
                     &bot,
                     target,
-                    "هنوز عضویت شما تأیید نشده است. ابتدا عضو کانال شوید و دوباره بررسی کنید.",
-                    join_channel_keyboard(),
+                    "هنوز عضویت شما در همه‌ی کانال‌ها تأیید نشده است. ابتدا عضو شوید و دوباره بررسی کنید.",
+                    required_channel_join_keyboard(&state)?,
                 )
                 .await?;
             }
@@ -2169,7 +2902,7 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                     &bot,
                     target,
                     "بررسی عضویت ممکن نشد. لطفاً بعداً دوباره تلاش کنید.",
-                    join_channel_keyboard(),
+                    required_channel_join_keyboard(&state)?,
                 )
                 .await?;
             }
@@ -2442,7 +3175,10 @@ async fn send_subscription_usage(
             edit_user_message_with_keyboard(
             bot,
             target,
-                "برای حساب شما اشتراکی در پنل پیدا نشد. اگر قبلاً پرداخت کرده‌اید، لطفاً با پشتیبانی تماس بگیرید.",
+            &format!(
+                "برای حساب شما اشتراکی در پنل پیدا نشد. اگر قبلاً پرداخت کرده‌اید، لطفاً با پشتیبانی @{} تماس بگیرید.",
+                state.support_username()
+            ),
             subscription_back_keyboard(),
         )
             .await?;
@@ -2515,7 +3251,10 @@ async fn send_client_subscription_link(
                 edit_user_message_with_keyboard(
                     bot,
                     target,
-                    "ارسال لینک اشتراک با خطا روبه‌رو شد؛ لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                    &format!(
+                        "ارسال لینک اشتراک با خطا روبه‌رو شد؛ لطفاً دوباره تلاش کنید یا با پشتیبانی @{} تماس بگیرید.",
+                        state.support_username()
+                    ),
                     subscription_back_keyboard(),
                 )
                 .await?;
@@ -2818,7 +3557,10 @@ async fn create_subscription_order(
                 edit_user_message_with_keyboard(
                     bot,
                     target,
-                    "ظرفیت ساخت نام کاربری جدید برای حساب شما تکمیل شده است؛ لطفاً با پشتیبانی تماس بگیرید.",
+                    &format!(
+                        "ظرفیت ساخت نام کاربری جدید برای حساب شما تکمیل شده است؛ لطفاً با پشتیبانی @{} تماس بگیرید.",
+                        state.support_username()
+                    ),
                     subscription_back_keyboard(),
                 )
                 .await?;
@@ -2888,7 +3630,20 @@ async fn create_subscription_order(
             }
             return Ok(());
         }
-        Err(error) => {
+        Err(CreateTariffPaymentOrderError::OrderAwaitingAdminReview) => {
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                &format!(
+                    "⏳ در حال حاضر شما یک سفارش باز دارید.\nلطفاً منتظر تأیید ادمین باشید.\nدر صورت بروز مشکل، با پشتیبانی @{} در ارتباط باشید.",
+                    state.support_username()
+                ),
+                subscription_back_keyboard(),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(CreateTariffPaymentOrderError::Database(error)) => {
             log::error!(
                 "Could not create payment order for Telegram user {}: {error}",
                 telegram_user_id
@@ -2896,7 +3651,10 @@ async fn create_subscription_order(
             edit_user_message_with_keyboard(
                 bot,
                 target,
-                "ثبت سفارش ممکن نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+                &format!(
+                    "ثبت سفارش ممکن نشد. لطفاً دوباره تلاش کنید یا با پشتیبانی @{} تماس بگیرید.",
+                    state.support_username()
+                ),
                 subscription_back_keyboard(),
             )
             .await?;
@@ -3009,7 +3767,10 @@ async fn create_subscription_order(
         edit_user_message_with_keyboard(
             bot,
             target,
-            "اطلاعات کارت پرداخت تنظیم نشده است و رزرو کیف پول لغو شد. لطفاً با پشتیبانی تماس بگیرید.",
+            &format!(
+                "اطلاعات کارت پرداخت تنظیم نشده است و رزرو کیف پول لغو شد. لطفاً با پشتیبانی @{} تماس بگیرید.",
+                state.support_username()
+            ),
             subscription_back_keyboard(),
         )
         .await?;
@@ -3021,18 +3782,20 @@ async fn create_subscription_order(
     } else {
         "🆕 خرید جدید"
     };
+    let support_username = state.support_username();
     edit_text_message(
         bot,
         target,
         format!(
-            "🧾 جزئیات سفارش\n{kind}\n📦 بسته: {} گیگابایت | ⏳ مدت: ۳۰ روز\n💰 مبلغ اصلی اشتراک: {}\n👛 کسر از کیف پول: {}\n<b>💳 مبلغ نهایی قابل پرداخت: {}</b>\n👛 موجودی پس از تأیید پرداخت: {}\n\n💳 شماره کارت:\n(برای کپی، یک‌بار روی شماره کارت ضربه بزنید)\n\n<blockquote><code>{}</code></blockquote>\n👤 به نام: {}\n\n🧾 پس از واریز مبلغ نهایی، عکس رسید را همین‌جا ارسال کنید.\n⚠️ فقط عکس رسید پذیرفته می‌شود.\n🆘 پشتیبانی: @ipublicsupport",
+            "🧾 جزئیات سفارش\n{kind}\n📦 بسته: {} گیگابایت | ⏳ مدت: ۳۰ روز\n💰 مبلغ اصلی اشتراک: {}\n👛 کسر از کیف پول: {}\n<b>💳 مبلغ نهایی قابل پرداخت: {}</b>\n👛 موجودی پس از تأیید پرداخت: {}\n\n💳 شماره کارت:\n(برای کپی، یک‌بار روی شماره کارت ضربه بزنید)\n\n<blockquote><code>{}</code></blockquote>\n👤 به نام: {}\n\n🧾 پس از واریز مبلغ نهایی، عکس رسید را همین‌جا ارسال کنید.\n⚠️ فقط عکس رسید پذیرفته می‌شود.\n🆘 پشتیبانی: @{}",
             persian_digits(plan_gb),
             format_toman(price_toman),
             format_toman(wallet_used_toman),
             format_toman(amount_due_toman),
             format_signed_toman(wallet_balance_after),
             html_escape(&card_number),
-            html_escape(&cardholder_name)
+            html_escape(&cardholder_name),
+            html_escape(&support_username)
         ),
         Some("HTML"),
         Some(payment_order_keyboard(order_id)),
@@ -3101,10 +3864,11 @@ async fn receive_payment_receipt(
     let Some(sender) = msg.from.as_ref() else {
         return Ok(());
     };
+    let support_username = state.support_username();
     let Some(photo) = msg.photo().and_then(|photos| photos.last()) else {
         bot.send_message(
             msg.chat.id,
-            "فقط عکس رسید تراکنش قابل ارسال است؛ لطفاً عکس رسید را همین‌جا بفرستید.\nاگر به عکس رسید دسترسی ندارید، با پشتیبانی @ipublicsupport در ارتباط باشید.",
+            format!("فقط عکس رسید تراکنش قابل ارسال است؛ لطفاً عکس رسید را همین‌جا بفرستید.\nاگر به عکس رسید دسترسی ندارید، با پشتیبانی @{support_username} در ارتباط باشید."),
         )
         .await?;
         return Ok(());
@@ -3143,7 +3907,7 @@ async fn receive_payment_receipt(
             }
             bot.send_message(
                 msg.chat.id,
-                "خواندن سفارش پس از دریافت رسید انجام نشد. لطفاً عکس رسید را دوباره ارسال کنید یا با پشتیبانی @ipublicsupport تماس بگیرید.",
+                format!("خواندن سفارش پس از دریافت رسید انجام نشد. لطفاً عکس رسید را دوباره ارسال کنید یا با پشتیبانی @{support_username} تماس بگیرید."),
             )
             .await?;
             return Ok(());
@@ -3157,7 +3921,7 @@ async fn receive_payment_receipt(
             }
             bot.send_message(
                 msg.chat.id,
-                "خواندن سفارش پس از دریافت رسید انجام نشد. لطفاً کمی بعد عکس را دوباره ارسال کنید یا با پشتیبانی @ipublicsupport تماس بگیرید.",
+                format!("خواندن سفارش پس از دریافت رسید انجام نشد. لطفاً کمی بعد عکس را دوباره ارسال کنید یا با پشتیبانی @{support_username} تماس بگیرید."),
             )
             .await?;
             return Ok(());
@@ -3211,7 +3975,7 @@ async fn receive_payment_receipt(
         }
         bot.send_message(
             msg.chat.id,
-            "رسید به مالک یا ادمین‌ها تحویل نشد؛ لطفاً کمی بعد دوباره عکس رسید را ارسال کنید یا با پشتیبانی @ipublicsupport تماس بگیرید.",
+            format!("رسید به مالک یا ادمین‌ها تحویل نشد؛ لطفاً کمی بعد دوباره عکس رسید را ارسال کنید یا با پشتیبانی @{support_username} تماس بگیرید."),
         )
         .await?;
         return Ok(());
@@ -3480,10 +4244,11 @@ async fn reject_payment_order(
                 source_message.as_ref(),
             )
             .await;
+            let support_username = state.support_username();
             if let Err(error) = bot
                 .send_message(
                     UserId(telegram_user_id),
-                    "❌ درخواست پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @ipublicsupport در ارتباط باشید.",
+                    format!("❌ درخواست پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @{support_username} در ارتباط باشید."),
                 )
                 .await
             {
@@ -3727,17 +4492,18 @@ fn persian_datetime(datetime: chrono::DateTime<chrono_tz::Tz>) -> String {
 
 async fn ensure_required_channel_member(
     bot: &Bot,
+    state: &AppState,
     target: Option<CallbackMessageTarget>,
     user_id: UserId,
 ) -> Result<bool> {
-    match is_required_channel_member(bot, user_id).await {
+    match is_required_channel_member(bot, state, user_id).await {
         Ok(true) => Ok(true),
         Ok(false) => {
             edit_user_message_with_keyboard(
                 bot,
                 target,
-                "برای استفاده از ربات، ابتدا در کانال ما عضو شوید و سپس «عضو شدم» را بزنید.",
-                join_channel_keyboard(),
+                "برای استفاده از ربات، ابتدا در همه‌ی کانال‌های زیر عضو شوید و سپس «عضو شدم» را بزنید.",
+                required_channel_join_keyboard(state)?,
             )
             .await?;
             Ok(false)
@@ -3748,7 +4514,7 @@ async fn ensure_required_channel_member(
                 bot,
                 target,
                 "بررسی عضویت ممکن نشد. لطفاً بعداً دوباره تلاش کنید.",
-                join_channel_keyboard(),
+                required_channel_join_keyboard(state)?,
             )
             .await?;
             Ok(false)
@@ -3756,19 +4522,31 @@ async fn ensure_required_channel_member(
     }
 }
 
-async fn is_required_channel_member(bot: &Bot, user_id: UserId) -> ResponseResult<bool> {
-    let member = bot
-        .get_chat_member(REQUIRED_CHANNEL.to_owned(), user_id)
-        .await?;
-    Ok(member.kind.is_present())
+async fn is_required_channel_member(bot: &Bot, state: &AppState, user_id: UserId) -> Result<bool> {
+    if !state.required_channels_enabled()? {
+        return Ok(true);
+    }
+    for channel in state.required_channels()? {
+        let member = bot
+            .get_chat_member(format!("@{}", channel.username), user_id)
+            .await?;
+        if !member.kind.is_present() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-async fn send_join_prompt(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
+fn required_channel_join_keyboard(state: &AppState) -> rusqlite::Result<InlineKeyboardMarkup> {
+    Ok(join_channel_keyboard(&state.required_channels()?))
+}
+
+async fn send_join_prompt(bot: &Bot, chat_id: ChatId, state: &AppState) -> Result<()> {
     send_user_message_with_keyboard(
         bot,
         chat_id,
-        "برای استفاده از ربات، ابتدا در کانال ما عضو شوید و سپس «عضو شدم» را بزنید.",
-        join_channel_keyboard(),
+        "برای استفاده از ربات، ابتدا در همه‌ی کانال‌های زیر عضو شوید و سپس «عضو شدم» را بزنید.",
+        required_channel_join_keyboard(state)?,
     )
     .await?;
     Ok(())
@@ -3788,6 +4566,14 @@ fn owner_keyboard() -> InlineKeyboardMarkup {
             "💳 مدیریت شماره کارت",
             "owner:payment:manage",
         )],
+        vec![InlineKeyboardButton::callback(
+            "🆘 تغییر آیدی پشتیبان",
+            "owner:support:set",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "📢 تنظیم کانال اجباری",
+            "owner:channels:manage",
+        )],
         vec![
             InlineKeyboardButton::callback("📢 پیام همگانی", "owner:broadcast:all"),
             InlineKeyboardButton::callback("💳 پیام به مشترکین", "owner:broadcast:subscribers"),
@@ -3797,6 +4583,18 @@ fn owner_keyboard() -> InlineKeyboardMarkup {
             "owner:sales:manage",
         )],
         vec![InlineKeyboardButton::callback(
+            "🎁 تنظیمات رفرال",
+            "owner:referral:manage",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🗄 مدیریت دیتابیس",
+            "owner:database:manage",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "👤 مدیریت کاربران",
+            "owner:users:manage",
+        )],
+        vec![InlineKeyboardButton::callback(
             "📦 مدیریت تعرفه‌ها",
             "owner:tariffs:manage",
         )],
@@ -3804,8 +4602,625 @@ fn owner_keyboard() -> InlineKeyboardMarkup {
             "〽️ مدیریت کیف پول کاربران",
             "owner:wallet:manage",
         )],
+        vec![InlineKeyboardButton::callback(
+            "📊 آمار مالی",
+            "owner:finance:manage",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "💽 مدیریت فضای دیسک",
+            "owner:disk:manage",
+        )],
     ];
     InlineKeyboardMarkup::new(rows)
+}
+
+#[derive(Clone, Copy)]
+enum FinancialMetric {
+    Revenue,
+    Commissions,
+    ReferredUsers,
+    ReferralOrders,
+    AverageReferralRevenue,
+    WalletBalances,
+}
+
+fn financial_metric_from_callback(data: &str) -> Option<FinancialMetric> {
+    match data {
+        "owner:finance:revenue" => Some(FinancialMetric::Revenue),
+        "owner:finance:commissions" => Some(FinancialMetric::Commissions),
+        "owner:finance:referred_users" => Some(FinancialMetric::ReferredUsers),
+        "owner:finance:referral_orders" => Some(FinancialMetric::ReferralOrders),
+        "owner:finance:average_referral_revenue" => Some(FinancialMetric::AverageReferralRevenue),
+        "owner:finance:wallet_balances" => Some(FinancialMetric::WalletBalances),
+        _ => None,
+    }
+}
+
+async fn send_financial_statistics_menu(bot: &Bot, owner_id: UserId) -> ResponseResult<()> {
+    send_text_message_with_keyboard(
+        bot,
+        owner_id,
+        "📊 آمار مالی\n\nبرای مشاهده‌ی هر آمار، دکمه‌ی مربوط به آن را انتخاب کنید.",
+        financial_statistics_keyboard(),
+    )
+    .await
+}
+
+fn financial_statistics_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "💰 کل درآمد فروش",
+            "owner:finance:revenue",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🎁 کل پورسانت پرداخت‌شده",
+            "owner:finance:commissions",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "👥 تعداد کاربران جذب‌شده از رفرال",
+            "owner:finance:referred_users",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🛒 تعداد خریدهای انجام‌شده توسط زیرمجموعه‌ها",
+            "owner:finance:referral_orders",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "📈 میانگین خرید هر زیرمجموعه",
+            "owner:finance:average_referral_revenue",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "〽️ مجموع موجودی کیف پول کاربران",
+            "owner:finance:wallet_balances",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🔙 بازگشت به منوی مالک",
+            "owner:main",
+        )],
+    ])
+}
+
+async fn send_financial_statistic(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+    metric: FinancialMetric,
+) -> ResponseResult<()> {
+    let statistics = match state.financial_statistics() {
+        Ok(statistics) => statistics,
+        Err(error) => {
+            log::error!("Could not read financial statistics: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن آمار مالی انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let (label, value) = financial_statistic_value(statistics, metric);
+    send_text_message_with_keyboard(
+        bot,
+        owner_id,
+        format!("{label}\n\n{value}"),
+        financial_statistic_result_keyboard(),
+    )
+    .await
+}
+
+fn financial_statistic_value(
+    statistics: FinancialStatistics,
+    metric: FinancialMetric,
+) -> (&'static str, String) {
+    match metric {
+        FinancialMetric::Revenue => (
+            "💰 کل درآمد فروش (سفارش‌های تأییدشده)",
+            format_signed_toman(statistics.total_sales_toman),
+        ),
+        FinancialMetric::Commissions => (
+            "🎁 کل پورسانت پرداخت‌شده",
+            format_signed_toman(statistics.total_commissions_toman),
+        ),
+        FinancialMetric::ReferredUsers => (
+            "👥 تعداد کاربران جذب‌شده از رفرال",
+            persian_digits(statistics.referred_users),
+        ),
+        FinancialMetric::ReferralOrders => (
+            "🛒 تعداد خریدهای انجام‌شده توسط زیرمجموعه‌ها",
+            persian_digits(statistics.referral_orders),
+        ),
+        FinancialMetric::AverageReferralRevenue => (
+            "📈 میانگین مبلغ خرید هر زیرمجموعه‌ی خریدار",
+            format_signed_toman(statistics.average_referral_revenue_toman),
+        ),
+        FinancialMetric::WalletBalances => (
+            "〽️ مجموع موجودی کیف پول کاربران",
+            format_signed_toman(statistics.total_wallet_balance_toman),
+        ),
+    }
+}
+
+fn financial_statistic_result_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🔙 بازگشت به آمار مالی",
+            "owner:finance:manage",
+        )],
+        vec![InlineKeyboardButton::callback("🏠 منوی مالک", "owner:main")],
+    ])
+}
+
+async fn send_disk_space_management(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match state.disk_space_usage() {
+        Ok(usage) => {
+            let free_percent = usage.free_bytes as f64 * 100.0 / usage.total_bytes as f64;
+            let body = format!(
+                "💽 فضای دیسک سرور (دیسک محل دیتابیس)\n\n💽 ظرفیت کل: {}\n🟢 فضای خالی: {}\n📊 درصد فضای خالی: {}٪\n⛔ آستانه‌ی هشدار روزانه: کمتر از ۱۵٪",
+                format_disk_space(usage.total_bytes),
+                format_disk_space(usage.free_bytes),
+                persian_digits(format!("{free_percent:.2}"))
+            );
+            send_text_message_with_keyboard(bot, owner_id, body, disk_space_management_keyboard())
+                .await?;
+        }
+        Err(error) => {
+            log::error!("Could not read disk-space usage for owner view: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن فضای دیسک انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn disk_space_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت به منوی مالک",
+        "owner:main",
+    )]])
+}
+
+fn disk_space_below_alert_threshold(usage: DiskSpaceUsage) -> bool {
+    u128::from(usage.free_bytes) * 100 < u128::from(usage.total_bytes) * 15
+}
+
+fn format_disk_space(bytes: u64) -> String {
+    let gibibytes = bytes as f64 / 1024_f64.powi(3);
+    format!(
+        "{} گیگابایت",
+        persian_digits(format!("{gibibytes:.2}").replace('.', "٫"))
+    )
+}
+
+async fn send_wallet_management(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match state.wallet_statistics() {
+        Ok((total_balance, total_commissions)) => {
+            let body = format!(
+                "〽️ مدیریت کیف پول\n\n💰 مجموع موجودی تمام کیف پول‌ها: {}\n🎁 مجموع پورسانت‌های پرداخت‌شده: {}\n\nبرای تغییر گروهی یا دستی موجودی از دکمه‌ها استفاده کنید؛ ثبت دلیل تغییر الزامی است. در کاهش گروهی، موجودی تا صفر کم می‌شود و مبالغ رزروشده‌ی سفارش‌های باز حفظ می‌شوند.",
+                format_signed_toman(total_balance),
+                format_signed_toman(total_commissions)
+            );
+            send_text_message_with_keyboard(bot, owner_id, body, wallet_management_keyboard())
+                .await?;
+        }
+        Err(error) => {
+            log::error!("Could not read wallet statistics: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن آمار کیف پول‌ها انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn wallet_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🎁 افزایش موجودی همه‌ی کاربران",
+            "owner:wallet:increase_all",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "📉 کاهش موجودی همه‌ی کاربران",
+            "owner:wallet:decrease_all",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "✏️ تغییر دستی موجودی کاربر",
+            "owner:wallet:adjust",
+        )],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "owner:main")],
+    ])
+}
+
+fn bulk_wallet_adjustment_message(
+    action: WalletBulkAction,
+    amount_per_user: i64,
+    reason: &str,
+    summary: WalletBulkAdjustmentSummary,
+) -> String {
+    let action_name = match action {
+        WalletBulkAction::Increase => "افزایش",
+        WalletBulkAction::Decrease => "کاهش",
+    };
+    format!(
+        "✅ تغییر گروهی کیف پول‌ها انجام شد.\n📊 کاربران بررسی‌شده: {}\n✏️ کیف پول‌های تغییرکرده: {}\n⏭ بدون تغییر: {}\n💵 مبلغ {action_name} برای هر کاربر: {}\n🧮 مجموع مبلغ {action_name}: {}\n📝 دلیل: {}",
+        persian_digits(summary.targeted_users),
+        persian_digits(summary.changed_users),
+        persian_digits(summary.unchanged_users),
+        format_signed_toman(amount_per_user),
+        format_signed_toman(summary.total_adjusted_toman),
+        reason
+    )
+}
+
+async fn send_user_management_menu(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match state.bot_user_statistics() {
+        Ok((total_users, referred_users, commissions_paid)) => {
+            let body = format!(
+                "👤 آمار کاربران\n\n👥 تعداد کل کاربران: {}\n🔗 کاربران عضو‌شده با لینک رفرال: {}\n💰 مجموع پورسانت پرداخت‌شده: {}",
+                persian_digits(total_users),
+                persian_digits(referred_users),
+                format_signed_toman(commissions_paid)
+            );
+            send_text_message_with_keyboard(bot, owner_id, body, user_management_keyboard())
+                .await?;
+        }
+        Err(error) => {
+            log::error!("Could not read bot user statistics: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن آمار کاربران انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn user_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🔍 جستجوی کاربر",
+            "owner:users:search",
+        )],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "owner:main")],
+    ])
+}
+
+async fn send_user_search_results(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+    query: &str,
+) -> ResponseResult<()> {
+    match state.search_bot_users(query) {
+        Ok(users) if users.is_empty() => {
+            state.set_setup(owner_id, SetupState::UserSearch);
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                "کاربری با این شناسه یا نام کاربری پیدا نشد. دوباره جستجو کنید:",
+                user_search_results_keyboard(&[]),
+            )
+            .await?;
+        }
+        Ok(users) => {
+            let body = format!(
+                "🔍 {} کاربر پیدا شد. برای مشاهده‌ی اطلاعات، کاربر را انتخاب کنید:",
+                persian_digits(users.len())
+            );
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                body,
+                user_search_results_keyboard(&users),
+            )
+            .await?;
+        }
+        Err(error) => {
+            log::error!("Could not search bot users: {error}");
+            state.set_setup(owner_id, SetupState::UserSearch);
+            bot.send_message(
+                owner_id,
+                "جستجوی کاربر انجام نشد؛ دوباره شناسه یا نام کاربری را بفرستید یا /cancel را بزنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn user_search_results_keyboard(users: &[BotUserSearchResult]) -> InlineKeyboardMarkup {
+    let mut rows = users
+        .iter()
+        .map(|user| {
+            let mut label = user
+                .first_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("کاربر")
+                .to_owned();
+            if let Some(username) = &user.username {
+                label.push_str(&format!(" (@{})", username.trim_start_matches('@')));
+            }
+            label.push_str(&format!(" | {}", persian_digits(user.telegram_user_id)));
+            vec![InlineKeyboardButton::callback(
+                label,
+                format!("owner:users:item:{}", user.telegram_user_id),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "🔍 جستجوی دوباره",
+        "owner:users:search",
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت به مدیریت کاربران",
+        "owner:users:manage",
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+async fn send_managed_user_details(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+    telegram_user_id: u64,
+) -> ResponseResult<()> {
+    match state.bot_user_details(telegram_user_id) {
+        Ok(Some(user)) => {
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                managed_user_details_message(&user),
+                managed_user_details_keyboard(),
+            )
+            .await?;
+        }
+        Ok(None) => {
+            bot.send_message(owner_id, "کاربر پیدا نشد یا اطلاعات او در دسترس نیست.")
+                .await?;
+        }
+        Err(error) => {
+            log::error!("Could not read details for bot user {telegram_user_id}: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن اطلاعات کاربر انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn managed_user_details_message(user: &BotUserDetails) -> String {
+    let name = user
+        .first_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("ثبت نشده");
+    let username = user
+        .username
+        .as_deref()
+        .map(|username| format!("@{}", username.trim_start_matches('@')))
+        .unwrap_or_else(|| "ندارد".to_owned());
+    let referrer = match user.referrer_user_id {
+        Some(referrer_id) => {
+            let mut label = format!("شناسه‌ی {}", persian_digits(referrer_id));
+            if let Some(name) = user
+                .referrer_first_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                label.push_str(&format!(" | {name}"));
+            }
+            if let Some(username) = &user.referrer_username {
+                label.push_str(&format!(" | @{}", username.trim_start_matches('@')));
+            }
+            label
+        }
+        None => "ندارد".to_owned(),
+    };
+
+    format!(
+        "👤 اطلاعات کاربر\n\n🆔 شناسه: {}\n📝 نام: {}\n🔗 نام کاربری: {}\n👥 معرف: {}\n👥 تعداد زیرمجموعه‌ها: {}\n💰 پورسانت پرداخت‌شده به این کاربر: {}",
+        persian_digits(user.telegram_user_id),
+        name,
+        username,
+        referrer,
+        persian_digits(user.referral_count),
+        format_signed_toman(user.commissions_paid_toman)
+    )
+}
+
+fn managed_user_details_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "🔍 جستجوی کاربر دیگر",
+            "owner:users:search",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🔙 بازگشت به مدیریت کاربران",
+            "owner:users:manage",
+        )],
+    ])
+}
+
+async fn send_database_management(bot: &Bot, owner_id: UserId) -> ResponseResult<()> {
+    send_text_message_with_keyboard(
+        bot,
+        owner_id,
+        "🗄 مدیریت دیتابیس\n\nاز دیتابیس فعلی ربات می‌توانید بکاپ بگیرید. برای ریستور، همان فایل بکاپی را که ربات قبلاً برای شما فرستاده است ارسال کنید.",
+        database_management_keyboard(),
+    )
+    .await
+}
+
+fn database_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "📥 گرفتن بکاپ",
+            "owner:database:backup",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "📤 ریستور بکاپ",
+            "owner:database:restore",
+        )],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "owner:main")],
+    ])
+}
+
+fn reserve_temporary_database_file() -> io::Result<PathBuf> {
+    loop {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!(
+            "falconbot-db-{}-{sequence}.sqlite3",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                drop(file);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn remove_temporary_database_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != io::ErrorKind::NotFound {
+            log::warn!("Could not remove temporary database file: {error}");
+        }
+    }
+}
+
+async fn send_database_backup(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+    caption: &str,
+) -> Result<()> {
+    let backup_path = reserve_temporary_database_file()?;
+    let result = state
+        .create_database_backup(&backup_path)
+        .context("Could not create database backup");
+    if let Err(error) = result {
+        remove_temporary_database_file(&backup_path);
+        log::error!("Could not create database backup for owner {owner_id}: {error}");
+        bot.send_message(
+            owner_id,
+            "گرفتن بکاپ دیتابیس انجام نشد؛ لاگ برنامه را بررسی کنید.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let size = fs::metadata(&backup_path)?.len();
+    if size > MAX_DATABASE_BACKUP_SIZE {
+        remove_temporary_database_file(&backup_path);
+        bot.send_message(
+            owner_id,
+            "حجم بکاپ از محدودیت ارسال تلگرام بیشتر است و فایل ارسال نشد.",
+        )
+        .await?;
+        return Ok(());
+    }
+    let file_name = format!(
+        "falconbot-backup-{}.sqlite3",
+        chrono::Utc::now()
+            .with_timezone(&chrono_tz::Asia::Tehran)
+            .format("%Y-%m-%d")
+    );
+    let result = bot
+        .send_document(
+            owner_id,
+            InputFile::file(backup_path.clone()).file_name(file_name),
+        )
+        .caption(caption)
+        .await;
+    remove_temporary_database_file(&backup_path);
+    result?;
+    Ok(())
+}
+
+async fn restore_database_backup(
+    bot: &Bot,
+    owner_id: UserId,
+    msg: &Message,
+    state: &AppState,
+    document: &teloxide::types::Document,
+) -> Result<()> {
+    if u64::from(document.file.size) > MAX_DATABASE_BACKUP_SIZE {
+        state.set_setup(owner_id, SetupState::DatabaseRestore);
+        bot.send_message(
+            msg.chat.id,
+            "حجم فایل از محدودیت ۲۰ مگابایت بیشتر است. فایل بکاپ کوچک‌تری ارسال کنید یا /cancel را بزنید.",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let backup_path = reserve_temporary_database_file()?;
+    let rollback_path = match reserve_temporary_database_file() {
+        Ok(path) => path,
+        Err(error) => {
+            remove_temporary_database_file(&backup_path);
+            return Err(error.into());
+        }
+    };
+    let restore_result: Result<()> = async {
+        let file = bot.get_file(document.file.id.clone()).await?;
+        let mut destination = tokio::fs::File::create(&backup_path).await?;
+        bot.download_file(&file.path, &mut destination).await?;
+        destination.flush().await?;
+        drop(destination);
+
+        if fs::metadata(&backup_path)?.len() > MAX_DATABASE_BACKUP_SIZE {
+            return Err(anyhow!("database backup exceeds the upload size limit"));
+        }
+        state
+            .restore_database_backup(&backup_path, &rollback_path)
+            .context("Uploaded file is not a valid FalconBOT database backup")?;
+        Ok(())
+    }
+    .await;
+    remove_temporary_database_file(&backup_path);
+    remove_temporary_database_file(&rollback_path);
+
+    match restore_result {
+        Ok(()) => {
+            log::info!("Owner {owner_id} restored the database from an uploaded backup");
+            bot.send_message(msg.chat.id, "✅ بکاپ با موفقیت ریستور شد.")
+                .reply_markup(owner_keyboard())
+                .await?;
+        }
+        Err(error) => {
+            log::error!("Could not restore database backup for owner {owner_id}: {error}");
+            state.set_setup(owner_id, SetupState::DatabaseRestore);
+            bot.send_message(
+                msg.chat.id,
+                "ریستور انجام نشد؛ فایل معتبرِ بکاپ همین ربات را بفرستید. اگر مشکل ادامه داشت، لاگ برنامه را بررسی کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 fn is_admin_review_action(data: &str) -> bool {
@@ -3863,6 +5278,110 @@ async fn send_sales_management(
         }
     }
     Ok(())
+}
+
+async fn send_required_channel_management(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match (state.required_channels_enabled(), state.required_channels()) {
+        (Ok(enabled), Ok(channels)) => {
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                required_channel_management_message(enabled, &channels),
+                required_channel_management_keyboard(enabled, &channels),
+            )
+            .await?;
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            log::error!("Could not read required channel settings: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن تنظیمات کانال اجباری انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_referral_management(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match state.referral_status() {
+        Ok((enabled, percent)) => {
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                referral_status_message(enabled, percent),
+                referral_management_keyboard(enabled),
+            )
+            .await?;
+        }
+        Err(error) => {
+            log::error!("Could not read referral settings: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن تنظیمات رفرال انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn update_referrals_enabled(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+    enabled: bool,
+) -> ResponseResult<()> {
+    match state.set_referrals_enabled(enabled) {
+        Ok(()) => {
+            log::info!(
+                "Owner {owner_id} {} referral acquisition",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            send_referral_management(bot, owner_id, state).await?;
+        }
+        Err(error) => {
+            log::error!("Could not update referral availability: {error}");
+            bot.send_message(
+                owner_id,
+                "ذخیره‌ی وضعیت رفرال انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn referral_status_message(enabled: bool, percent: u8) -> String {
+    format!(
+        "🎁 وضعیت رفرال: {}\n💰 درصد پورسانت: {}٪\n\nبا خاموش‌کردن رفرال، ثبت زیرمجموعه‌های جدید و پرداخت پورسانت متوقف می‌شود. برای تغییر درصد، دکمه‌ی مربوط را بزنید.",
+        if enabled { "✅ فعال" } else { "⛔ غیرفعال" },
+        persian_digits(percent)
+    )
+}
+
+fn referral_management_keyboard(enabled: bool) -> InlineKeyboardMarkup {
+    let toggle_button = if enabled {
+        InlineKeyboardButton::callback("⛔ غیرفعال‌کردن رفرال", "owner:referral:disable")
+    } else {
+        InlineKeyboardButton::callback("✅ فعال‌کردن رفرال", "owner:referral:enable")
+    };
+    InlineKeyboardMarkup::new(vec![
+        vec![toggle_button],
+        vec![InlineKeyboardButton::callback(
+            "✏️ تغییر درصد پورسانت",
+            "owner:referral:percent",
+        )],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "owner:main")],
+    ])
 }
 
 async fn send_subscription_tariffs(
@@ -4033,6 +5552,55 @@ fn purchase_management_keyboard(
     ])
 }
 
+fn required_channel_management_message(enabled: bool, channels: &[RequiredChannel]) -> String {
+    let status = if enabled {
+        "✅ فعال"
+    } else {
+        "⛔ غیرفعال"
+    };
+    let channels = if channels.is_empty() {
+        "هنوز کانالی ثبت نشده است.".to_owned()
+    } else {
+        channels
+            .iter()
+            .map(|channel| format!("• @{}", channel.username))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "📢 عضویت اجباری: {status}\n\nکانال‌ها:\n{channels}\n\nکاربر باید در همه‌ی کانال‌های فهرست‌شده عضو باشد. ربات باید در کانال‌ها ادمین باشد."
+    )
+}
+
+fn required_channel_management_keyboard(
+    enabled: bool,
+    channels: &[RequiredChannel],
+) -> InlineKeyboardMarkup {
+    let mut rows = channels
+        .iter()
+        .map(|channel| {
+            vec![InlineKeyboardButton::callback(
+                format!("❌ حذف @{}", channel.username),
+                format!("owner:channels:remove:{}", channel.username),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "➕ افزودن کانال",
+        "owner:channels:add",
+    )]);
+    rows.push(vec![if enabled {
+        InlineKeyboardButton::callback("⛔ غیرفعال‌کردن عضویت اجباری", "owner:channels:toggle")
+    } else {
+        InlineKeyboardButton::callback("✅ فعال‌کردن عضویت اجباری", "owner:channels:toggle")
+    }]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت",
+        "owner:main",
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
 fn admin_management_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
@@ -4101,9 +5669,11 @@ fn referral_keyboard(link: &str) -> InlineKeyboardMarkup {
     ])
 }
 
-fn referral_message(link: &str, referrals: u64, commissions: i64) -> String {
+fn referral_message(link: &str, referrals: u64, commissions: i64, percent: u8) -> String {
     format!(
-        "🎁 پورسانت فعلی: ۱۵٪\n👥 اگر دوستتان با لینک دعوت شما ربات را Start کند، از مبلغ هر خرید یا تمدید موفق او، ۱۵٪ به کیف پول شما اضافه می‌شود.\n\n🔗 لینک دعوت اختصاصی شما:\n{link}\n\n👥 تعداد زیرمجموعه‌ها: {}\n💰 مجموع پورسانت ثبت‌شده: {}",
+        "🎁 پورسانت فعلی: {}٪\n👥 اگر دوستتان با لینک دعوت شما ربات را Start کند، از مبلغ هر خرید یا تمدید موفق او، {}٪ به کیف پول شما اضافه می‌شود.\n\n🔗 لینک دعوت اختصاصی شما:\n{link}\n\n👥 تعداد زیرمجموعه‌ها: {}\n💰 مجموع پورسانت ثبت‌شده: {}",
+        persian_digits(percent),
+        persian_digits(percent),
         persian_digits(referrals),
         format_signed_toman(commissions)
     )
@@ -4171,11 +5741,12 @@ fn panel_client_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
-fn support_keyboard() -> InlineKeyboardMarkup {
+fn support_keyboard(support_username: &str) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::url(
             "💬 ارسال پیام به پشتیبانی",
-            Url::parse("https://t.me/ipublicsupport").expect("support URL is valid"),
+            Url::parse(&format!("https://t.me/{support_username}"))
+                .expect("validated support username produces a valid Telegram URL"),
         )],
         vec![InlineKeyboardButton::callback("🔙 بازگشت", "user:main")],
     ])
@@ -4435,7 +6006,8 @@ fn wallet_message(balance: i64, debt: i64) -> String {
             .to_owned(),
     );
     paragraphs.push(
-        "🛍️ هر وقت بخواهید، می‌توانید هنگام خرید یا تمدید اشتراک از موجودی کیف پول استفاده کنید.".to_owned(),
+        "🛍️ هر وقت بخواهید، می‌توانید هنگام خرید یا تمدید اشتراک از موجودی کیف پول استفاده کنید."
+            .to_owned(),
     );
     paragraphs.join("\n\n")
 }
@@ -4472,6 +6044,18 @@ fn parse_management_number(value: &str) -> Option<u64> {
     (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
 }
 
+fn normalize_support_username(value: &str) -> Option<String> {
+    let value = value.trim().strip_prefix('@').unwrap_or(value.trim());
+    if !(5..=32).contains(&value.len())
+        || !value
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'_')
+    {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
 fn parse_management_signed_number(value: &str) -> Option<i64> {
     let value = value.trim();
     let (negative, digits) =
@@ -4490,17 +6074,22 @@ fn parse_management_signed_number(value: &str) -> Option<i64> {
     }
 }
 
-fn join_channel_keyboard() -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new(vec![
-        vec![InlineKeyboardButton::url(
-            "📢 عضویت در کانال",
-            Url::parse(REQUIRED_CHANNEL_URL).expect("required channel URL is valid"),
-        )],
-        vec![InlineKeyboardButton::callback(
-            "✅ عضو شدم",
-            "user:join:check",
-        )],
-    ])
+fn join_channel_keyboard(channels: &[RequiredChannel]) -> InlineKeyboardMarkup {
+    let mut rows = channels
+        .iter()
+        .map(|channel| {
+            vec![InlineKeyboardButton::url(
+                format!("📢 عضویت در @{}", channel.username),
+                Url::parse(&format!("https://t.me/{}", channel.username))
+                    .expect("validated channel username forms a valid Telegram URL"),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "✅ عضو شدم",
+        "user:join:check",
+    )]);
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn panel_keyboard() -> InlineKeyboardMarkup {
@@ -4530,6 +6119,77 @@ mod tests {
         assert_eq!(parse_management_number("۰"), Some(0));
         assert_eq!(parse_management_number("-10"), None);
         assert_eq!(parse_management_number("10 گیگ"), None);
+    }
+
+    #[test]
+    fn normalizes_support_usernames_with_optional_at_sign() {
+        assert_eq!(
+            normalize_support_username("@Falcon_Help"),
+            Some("falcon_help".to_owned())
+        );
+        assert_eq!(
+            normalize_support_username("falcon_help"),
+            Some("falcon_help".to_owned())
+        );
+        assert!(normalize_support_username("abc").is_none());
+        assert!(normalize_support_username("support-name").is_none());
+        assert!(normalize_support_username("support name").is_none());
+    }
+
+    #[test]
+    fn normalizes_public_required_channel_usernames() {
+        assert_eq!(
+            state::normalize_required_channel_username("@Falcon_News"),
+            Some("falcon_news".to_owned())
+        );
+        assert_eq!(
+            state::normalize_required_channel_username("  Falcon_News  "),
+            Some("falcon_news".to_owned())
+        );
+        assert!(state::normalize_required_channel_username("abc").is_none());
+        assert!(state::normalize_required_channel_username("@12345").is_none());
+        assert!(state::normalize_required_channel_username("news-channel").is_none());
+    }
+
+    #[test]
+    fn required_channel_management_and_join_keyboards_show_all_actions() {
+        let channels = vec![
+            RequiredChannel {
+                username: "falcon_news".into(),
+            },
+            RequiredChannel {
+                username: "haku_news".into(),
+            },
+        ];
+        let keyboard = required_channel_management_keyboard(true, &channels).inline_keyboard;
+        let callbacks = keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                InlineKeyboardButtonKind::Url(_) | InlineKeyboardButtonKind::CopyText(_) => None,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(callbacks.contains(&"owner:channels:add"));
+        assert!(callbacks.contains(&"owner:channels:toggle"));
+        assert!(callbacks.contains(&"owner:channels:remove:falcon_news"));
+        assert!(callbacks.contains(&"owner:channels:remove:haku_news"));
+
+        let join_rows = join_channel_keyboard(&channels).inline_keyboard;
+        assert_eq!(join_rows.len(), 3);
+        assert!(matches!(
+            &join_rows[0][0].kind,
+            InlineKeyboardButtonKind::Url(url) if url.as_str() == "https://t.me/falcon_news"
+        ));
+        assert!(matches!(
+            &join_rows[1][0].kind,
+            InlineKeyboardButtonKind::Url(url) if url.as_str() == "https://t.me/haku_news"
+        ));
+        assert!(matches!(
+            &join_rows[2][0].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:join:check"
+        ));
     }
 
     #[test]
@@ -4679,8 +6339,12 @@ mod tests {
                 InlineKeyboardButtonKind::CallbackData(data) if data == "user:link"
             )));
         assert!(matches!(
-            &support_keyboard().inline_keyboard[0][0].kind,
+            &support_keyboard("ipublicsupport").inline_keyboard[0][0].kind,
             InlineKeyboardButtonKind::Url(url) if url.as_str() == "https://t.me/ipublicsupport"
+        ));
+        assert!(matches!(
+            &support_keyboard("falcon_help").inline_keyboard[0][0].kind,
+            InlineKeyboardButtonKind::Url(url) if url.as_str() == "https://t.me/falcon_help"
         ));
 
         let rich_message = user_menu_rich_message(USER_MENU_PROMPT);
@@ -4743,7 +6407,7 @@ mod tests {
     fn text_keyboard_preserves_actions_and_marks_back_buttons_red() {
         let rich_message = text_message_rich_message(
             "برای ارتباط با پشتیبانی از دکمه زیر استفاده کن 👇🏼",
-            &support_keyboard(),
+            &support_keyboard("ipublicsupport"),
         )
         .unwrap();
 
@@ -5028,12 +6692,186 @@ mod tests {
         )));
         assert!(owner_menu.iter().flatten().any(|button| matches!(
             &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:support:set"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:channels:manage"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
             InlineKeyboardButtonKind::CallbackData(data) if data == "owner:sales:manage"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:referral:manage"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:database:manage"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:users:manage"
         )));
         assert!(owner_menu.iter().flatten().any(|button| matches!(
             &button.kind,
             InlineKeyboardButtonKind::CallbackData(data) if data == "owner:wallet:manage"
         )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:finance:manage"
+        )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:disk:manage"
+        )));
+    }
+
+    #[test]
+    fn financial_statistics_keyboard_has_separate_owner_options() {
+        let rows = financial_statistics_keyboard().inline_keyboard;
+        let callbacks = rows
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            callbacks,
+            vec![
+                "owner:finance:revenue",
+                "owner:finance:commissions",
+                "owner:finance:referred_users",
+                "owner:finance:referral_orders",
+                "owner:finance:average_referral_revenue",
+                "owner:finance:wallet_balances",
+                "owner:main",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.len() == 1));
+    }
+
+    #[test]
+    fn managed_user_details_show_inviter_referrals_and_paid_commission() {
+        let message = managed_user_details_message(&BotUserDetails {
+            telegram_user_id: 20,
+            username: Some("invitee".into()),
+            first_name: Some("Invitee".into()),
+            referrer_user_id: Some(10),
+            referrer_username: Some("inviter".into()),
+            referrer_first_name: Some("Inviter".into()),
+            referral_count: 3,
+            commissions_paid_toman: 17_000,
+        });
+
+        assert!(message.contains("شناسه‌ی ۱۰"));
+        assert!(message.contains("@inviter"));
+        assert!(message.contains("تعداد زیرمجموعه‌ها: ۳"));
+        assert!(message.contains("پورسانت پرداخت‌شده به این کاربر: ۱۷٬۰۰۰ تومان"));
+    }
+
+    #[test]
+    fn wallet_management_keyboard_offers_manual_adjustment() {
+        let rows = wallet_management_keyboard().inline_keyboard;
+        let callbacks = rows
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(callbacks.contains(&"owner:wallet:adjust"));
+        assert!(callbacks.contains(&"owner:wallet:increase_all"));
+        assert!(callbacks.contains(&"owner:wallet:decrease_all"));
+        assert!(callbacks.contains(&"owner:main"));
+    }
+
+    #[test]
+    fn bulk_wallet_adjustment_message_reports_results_and_reason() {
+        let message = bulk_wallet_adjustment_message(
+            WalletBulkAction::Decrease,
+            10_000,
+            "اصلاح موجودی",
+            WalletBulkAdjustmentSummary {
+                targeted_users: 5,
+                changed_users: 3,
+                unchanged_users: 2,
+                total_adjusted_toman: 25_000,
+            },
+        );
+
+        assert!(message.contains("کاربران بررسی‌شده: ۵"));
+        assert!(message.contains("کیف پول‌های تغییرکرده: ۳"));
+        assert!(message.contains("مجموع مبلغ کاهش: ۲۵٬۰۰۰ تومان"));
+        assert!(message.contains("دلیل: اصلاح موجودی"));
+    }
+
+    #[test]
+    fn database_management_keyboard_offers_backup_and_restore() {
+        let rows = database_management_keyboard().inline_keyboard;
+        let callbacks = rows
+            .iter()
+            .flatten()
+            .filter_map(|button| match &button.kind {
+                InlineKeyboardButtonKind::CallbackData(data) => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(callbacks.contains(&"owner:database:backup"));
+        assert!(callbacks.contains(&"owner:database:restore"));
+        assert!(callbacks.contains(&"owner:main"));
+    }
+
+    #[test]
+    fn daily_backup_delay_targets_midnight_in_iran_time() {
+        let now = chrono_tz::Asia::Tehran
+            .with_ymd_and_hms(2026, 11, 21, 23, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            duration_until_next_iran_midnight(now).unwrap(),
+            std::time::Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn daily_disk_space_check_delay_targets_three_pm_in_iran_time() {
+        let now = chrono_tz::Asia::Tehran
+            .with_ymd_and_hms(2026, 11, 21, 14, 30, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            duration_until_next_iran_time(now, 15, 0).unwrap(),
+            std::time::Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn disk_space_warning_uses_a_strict_fifteen_percent_threshold() {
+        assert!(disk_space_below_alert_threshold(DiskSpaceUsage {
+            total_bytes: 1_000,
+            free_bytes: 149,
+        }));
+        assert!(!disk_space_below_alert_threshold(DiskSpaceUsage {
+            total_bytes: 1_000,
+            free_bytes: 150,
+        }));
+    }
+
+    #[test]
+    fn disk_space_is_displayed_in_gigabytes_without_byte_totals() {
+        assert_eq!(format_disk_space(1_073_741_824), "۱٫۰۰ گیگابایت");
     }
 
     #[test]
@@ -5074,7 +6912,7 @@ mod tests {
 
     #[test]
     fn referral_message_explains_the_commission_rate_and_qualifying_orders() {
-        let message = referral_message("https://t.me/foxngbot?start=ref_123", 2, 15_000);
+        let message = referral_message("https://t.me/foxngbot?start=ref_123", 2, 15_000, 15);
 
         assert!(message.contains("پورسانت فعلی: ۱۵٪"));
         assert!(message.contains("ربات را Start کند"));

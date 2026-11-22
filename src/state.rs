@@ -1,6 +1,15 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
-use std::{collections::HashMap, fs, path::Path, sync::Mutex};
+use rusqlite::{
+    backup::{Backup, Progress},
+    params, Connection, DatabaseName, OptionalExtension, TransactionBehavior,
+};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::Duration,
+};
 use teloxide::types::UserId;
 use url::Url;
 use zeroize::Zeroizing;
@@ -8,6 +17,8 @@ use zeroize::Zeroizing;
 pub struct AppState {
     pub owner_id: UserId,
     database: Mutex<Connection>,
+    disk_space_path: PathBuf,
+    support_username: Mutex<String>,
     setup: Mutex<HashMap<UserId, SetupState>>,
     session: Mutex<Option<PanelSession>>,
     bot_username: Mutex<Option<String>>,
@@ -18,17 +29,62 @@ pub enum SetupState {
     AdminId,
     BroadcastAll,
     BroadcastSubscribers,
+    DatabaseRestore,
     NewTariffVolume,
-    NewTariffPrice { volume_gb: u16 },
+    NewTariffPrice {
+        volume_gb: u16,
+    },
+    ReferralPercent,
+    SupportId,
+    RequiredChannelUsername,
+    UserSearch,
     PaymentCardNumber,
-    PaymentCardholder { card_number: String },
+    PaymentCardholder {
+        card_number: String,
+    },
     PanelUrl,
-    Username { base_url: Url },
-    Password { base_url: Url, username: String },
-    TariffVolume { tariff_id: i64 },
-    TariffPrice { tariff_id: i64 },
+    Username {
+        base_url: Url,
+    },
+    Password {
+        base_url: Url,
+        username: String,
+    },
+    TariffVolume {
+        tariff_id: i64,
+    },
+    TariffPrice {
+        tariff_id: i64,
+    },
     WalletUserId,
-    WalletBalance { user_id: u64 },
+    WalletBalance {
+        user_id: u64,
+    },
+    WalletReason {
+        user_id: u64,
+        target_balance: i64,
+    },
+    WalletBulkAmount {
+        action: WalletBulkAction,
+    },
+    WalletBulkReason {
+        action: WalletBulkAction,
+        amount_toman: i64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletBulkAction {
+    Increase,
+    Decrease,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalletBulkAdjustmentSummary {
+    pub targeted_users: u64,
+    pub changed_users: u64,
+    pub unchanged_users: u64,
+    pub total_adjusted_toman: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +93,62 @@ pub struct SubscriptionTariff {
     pub volume_gb: u16,
     pub price_toman: u32,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotUserSearchResult {
+    pub telegram_user_id: u64,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotUserDetails {
+    pub telegram_user_id: u64,
+    pub username: Option<String>,
+    pub first_name: Option<String>,
+    pub referrer_user_id: Option<u64>,
+    pub referrer_username: Option<String>,
+    pub referrer_first_name: Option<String>,
+    pub referral_count: u64,
+    pub commissions_paid_toman: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FinancialStatistics {
+    pub total_sales_toman: i64,
+    pub total_commissions_toman: i64,
+    pub referred_users: u64,
+    pub referral_orders: u64,
+    pub average_referral_revenue_toman: i64,
+    pub total_wallet_balance_toman: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskSpaceUsage {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiredChannel {
+    pub username: String,
+}
+
+pub const MAX_REQUIRED_CHANNELS: usize = 20;
+
+pub fn normalize_required_channel_username(value: &str) -> Option<String> {
+    let value = value.trim();
+    let username = value.strip_prefix('@').unwrap_or(value);
+    let mut characters = username.bytes();
+    let first = characters.next()?;
+    if !(first.is_ascii_alphabetic()
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == b'_')
+        && (5..=32).contains(&username.len()))
+    {
+        return None;
+    }
+    Some(username.to_ascii_lowercase())
 }
 
 pub struct PaymentOrder {
@@ -61,6 +173,14 @@ pub struct CreatedPaymentOrder {
     pub wallet_used_toman: u32,
     pub amount_due_toman: u32,
     pub wallet_balance_after: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CreateTariffPaymentOrderError {
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+    #[error("user already has an order awaiting admin review")]
+    OrderAwaitingAdminReview,
 }
 
 pub struct PaymentReviewMessage {
@@ -98,6 +218,11 @@ struct PanelSession {
 impl AppState {
     pub fn new(owner_id: UserId, database_path: &str) -> Result<Self> {
         let path = Path::new(database_path);
+        let disk_space_path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -126,6 +251,8 @@ impl AppState {
             CREATE TABLE IF NOT EXISTS bot_users (
                 telegram_user_id TEXT PRIMARY KEY NOT NULL,
                 referred_by_user_id TEXT,
+                username TEXT,
+                first_name TEXT,
                 first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')),
                 last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
             );
@@ -142,6 +269,7 @@ impl AppState {
                 balance_after_toman INTEGER NOT NULL,
                 transaction_type TEXT NOT NULL,
                 order_id INTEGER,
+                description TEXT,
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
             );
             CREATE TABLE IF NOT EXISTS referral_commissions (
@@ -192,6 +320,13 @@ impl AppState {
                 renewals_enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
             );
+            CREATE TABLE IF NOT EXISTS referral_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                percent INTEGER NOT NULL DEFAULT 15 CHECK (percent BETWEEN 0 AND 100),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
+            );
+            INSERT OR IGNORE INTO referral_settings (id) VALUES (1);
             CREATE TABLE IF NOT EXISTS subscription_tariffs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 volume_gb INTEGER NOT NULL UNIQUE CHECK (volume_gb > 0),
@@ -201,8 +336,14 @@ impl AppState {
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
             );",
         )?;
+        migrate_support_settings(&database)?;
+        migrate_required_channels(&database)?;
+        let support_username = read_support_username(&database)?;
         migrate_commerce_settings(&database)?;
         migrate_bot_user_referrals(&database)?;
+        migrate_bot_user_profile(&database)?;
+        migrate_wallet_transaction_descriptions(&database)?;
+        migrate_financial_transaction_constraints(&database)?;
         migrate_payment_wallet_columns(&database)?;
         seed_subscription_tariffs(&database)?;
         database.execute_batch(
@@ -245,10 +386,107 @@ impl AppState {
         Ok(Self {
             owner_id,
             database: Mutex::new(database),
+            disk_space_path,
+            support_username: Mutex::new(support_username),
             setup: Mutex::new(HashMap::new()),
             session: Mutex::new(None),
             bot_username: Mutex::new(None),
         })
+    }
+
+    pub fn disk_space_usage(&self) -> std::io::Result<DiskSpaceUsage> {
+        let total_bytes = fs2::total_space(&self.disk_space_path)?;
+        let free_bytes = fs2::free_space(&self.disk_space_path)?;
+        if total_bytes == 0 {
+            return Err(std::io::Error::other(
+                "filesystem reported zero total space",
+            ));
+        }
+        Ok(DiskSpaceUsage {
+            total_bytes,
+            free_bytes,
+        })
+    }
+
+    pub fn create_database_backup(&self, backup_path: &Path) -> rusqlite::Result<()> {
+        let database = self.database.lock().expect("database lock poisoned");
+        database.backup(DatabaseName::Main, backup_path, None)
+    }
+
+    pub fn restore_database_backup(
+        &self,
+        backup_path: &Path,
+        rollback_path: &Path,
+    ) -> rusqlite::Result<()> {
+        let source = Connection::open(backup_path)?;
+        let integrity: String = source.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tables = source
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        const REQUIRED_TABLES: &[&str] = &[
+            "admins",
+            "bot_users",
+            "commerce_settings",
+            "panel_settings",
+            "panel_users",
+            "payment_orders",
+            "payment_review_messages",
+            "payment_settings",
+            "referral_commissions",
+            "referral_settings",
+            "subscription_tariffs",
+            "wallet_reservations",
+            "wallet_transactions",
+            "wallets",
+        ];
+        if REQUIRED_TABLES
+            .iter()
+            .any(|required| !tables.iter().any(|table| table == required))
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+
+        let mut database = self.database.lock().expect("database lock poisoned");
+        database.backup(DatabaseName::Main, rollback_path, None)?;
+        let restore_result = {
+            let backup = Backup::new(&source, &mut database)?;
+            backup.run_to_completion(100, Duration::from_millis(10), None::<fn(Progress)>)
+        };
+        let restore_result = restore_result.and_then(|()| {
+            migrate_support_settings(&database)?;
+            migrate_required_channels(&database)?;
+            migrate_commerce_settings(&database)?;
+            migrate_bot_user_referrals(&database)?;
+            migrate_bot_user_profile(&database)?;
+            migrate_payment_wallet_columns(&database)?;
+            migrate_wallet_transaction_descriptions(&database)?;
+            migrate_panel_user_mapping(&database)?;
+            seed_subscription_tariffs(&database)?;
+            read_support_username(&database)
+        });
+        let support_username = match restore_result {
+            Ok(support_username) => support_username,
+            Err(error) => {
+                if let Err(rollback_error) =
+                    database.restore(DatabaseName::Main, rollback_path, None::<fn(Progress)>)
+                {
+                    log::error!(
+                        "Database restore failed ({error}) and rollback failed ({rollback_error})"
+                    );
+                    return Err(rollback_error);
+                }
+                return Err(error);
+            }
+        };
+        *self
+            .support_username
+            .lock()
+            .expect("support username lock poisoned") = support_username;
+        Ok(())
     }
 
     pub fn set_bot_username(&self, username: String) {
@@ -348,8 +586,14 @@ impl AppState {
     ) -> rusqlite::Result<()> {
         let database = self.database.lock().expect("database lock poisoned");
         let transaction = database.unchecked_transaction()?;
-        if let Some(referrer_id) =
-            referred_by_user_id.filter(|id| *id != telegram_user_id && *id > 0)
+        let referrals_enabled = transaction.query_row(
+            "SELECT enabled FROM referral_settings WHERE id = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if let Some(referrer_id) = referred_by_user_id
+            .filter(|_| referrals_enabled)
+            .filter(|id| *id != telegram_user_id && *id > 0)
         {
             transaction.execute(
                 "INSERT INTO bot_users (telegram_user_id, referred_by_user_id)
@@ -367,6 +611,136 @@ impl AppState {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn update_bot_user_profile(
+        &self,
+        telegram_user_id: u64,
+        username: Option<&str>,
+        first_name: &str,
+    ) -> rusqlite::Result<()> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "UPDATE bot_users SET username = ?1, first_name = ?2,
+                    last_seen_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')
+                 WHERE telegram_user_id = ?3",
+                params![username, first_name, telegram_user_id.to_string()],
+            )?;
+        Ok(())
+    }
+
+    pub fn bot_user_statistics(&self) -> rusqlite::Result<(u64, u64, i64)> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM bot_users),
+                    (SELECT COUNT(*) FROM bot_users WHERE referred_by_user_id IS NOT NULL),
+                    COALESCE((SELECT SUM(amount_toman) FROM referral_commissions), 0)",
+                [],
+                |row| {
+                    let total_users: i64 = row.get(0)?;
+                    let referred_users: i64 = row.get(1)?;
+                    Ok((
+                        total_users.max(0) as u64,
+                        referred_users.max(0) as u64,
+                        row.get(2)?,
+                    ))
+                },
+            )
+    }
+
+    pub fn search_bot_users(&self, query: &str) -> rusqlite::Result<Vec<BotUserSearchResult>> {
+        let query = query.trim().trim_start_matches('@');
+        let database = self.database.lock().expect("database lock poisoned");
+        let mut statement = database.prepare(
+            "SELECT
+                bu.telegram_user_id,
+                COALESCE(bu.username, MAX(po.telegram_username)),
+                bu.first_name
+             FROM bot_users bu
+             LEFT JOIN payment_orders po
+                ON po.telegram_user_id = bu.telegram_user_id
+             WHERE bu.telegram_user_id = ?1
+                OR lower(bu.username) = lower(?2)
+                OR lower(ltrim(po.telegram_username, '@')) = lower(?2)
+             GROUP BY bu.telegram_user_id
+             ORDER BY bu.telegram_user_id
+             LIMIT 10",
+        )?;
+        let users = statement
+            .query_map(params![query, query], |row| {
+                let telegram_user_id: String = row.get(0)?;
+                let telegram_user_id = telegram_user_id.parse::<u64>().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(BotUserSearchResult {
+                    telegram_user_id,
+                    username: row.get(1)?,
+                    first_name: row.get(2)?,
+                })
+            })?
+            .collect();
+        users
+    }
+
+    pub fn bot_user_details(
+        &self,
+        telegram_user_id: u64,
+    ) -> rusqlite::Result<Option<BotUserDetails>> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT
+                    bu.username,
+                    bu.first_name,
+                    bu.referred_by_user_id,
+                    referrer.username,
+                    referrer.first_name,
+                    (SELECT COUNT(*) FROM bot_users
+                     WHERE referred_by_user_id = bu.telegram_user_id),
+                    COALESCE((SELECT SUM(amount_toman) FROM referral_commissions
+                              WHERE referrer_user_id = bu.telegram_user_id), 0)
+                 FROM bot_users bu
+                 LEFT JOIN bot_users referrer
+                    ON referrer.telegram_user_id = bu.referred_by_user_id
+                 WHERE bu.telegram_user_id = ?1",
+                [telegram_user_id.to_string()],
+                |row| {
+                    let referrer_id: Option<String> = row.get(2)?;
+                    let referrer_id = referrer_id
+                        .map(|id| {
+                            id.parse::<u64>().map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let referral_count: i64 = row.get(5)?;
+                    Ok(BotUserDetails {
+                        telegram_user_id,
+                        username: row.get(0)?,
+                        first_name: row.get(1)?,
+                        referrer_user_id: referrer_id,
+                        referrer_username: row.get(3)?,
+                        referrer_first_name: row.get(4)?,
+                        referral_count: referral_count.max(0) as u64,
+                        commissions_paid_toman: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn referral_summary(&self, telegram_user_id: u64) -> rusqlite::Result<(u64, i64)> {
@@ -406,6 +780,25 @@ impl AppState {
         telegram_user_id: u64,
         target_balance_toman: i64,
     ) -> rusqlite::Result<i64> {
+        self.set_wallet_balance_with_reason(
+            telegram_user_id,
+            target_balance_toman,
+            "تغییر دستی موجودی",
+        )
+    }
+
+    pub fn set_wallet_balance_with_reason(
+        &self,
+        telegram_user_id: u64,
+        target_balance_toman: i64,
+        reason: &str,
+    ) -> rusqlite::Result<i64> {
+        let reason = reason.trim();
+        if reason.is_empty() || reason.chars().count() > 500 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "wallet adjustment reason must contain 1 to 500 characters".to_owned(),
+            ));
+        }
         let mut database = self.database.lock().expect("database lock poisoned");
         let transaction = database.transaction()?;
         let telegram_user_id = telegram_user_id.to_string();
@@ -451,13 +844,174 @@ impl AppState {
         if adjustment != 0 {
             transaction.execute(
                 "INSERT INTO wallet_transactions
-                    (telegram_user_id, amount_toman, balance_after_toman, transaction_type)
-                 VALUES (?1, ?2, ?3, 'owner_adjustment')",
-                params![telegram_user_id, adjustment, target_balance_toman],
+                    (telegram_user_id, amount_toman, balance_after_toman,
+                     transaction_type, description)
+                 VALUES (?1, ?2, ?3, 'owner_adjustment', ?4)",
+                params![telegram_user_id, adjustment, target_balance_toman, reason],
             )?;
         }
         transaction.commit()?;
         Ok(previous_balance)
+    }
+
+    pub fn wallet_statistics(&self) -> rusqlite::Result<(i64, i64)> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT
+                    COALESCE((SELECT SUM(balance_toman) FROM wallets), 0),
+                    COALESCE((SELECT SUM(amount_toman) FROM referral_commissions), 0)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+    }
+
+    pub fn financial_statistics(&self) -> rusqlite::Result<FinancialStatistics> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT
+                    COALESCE((SELECT SUM(price_toman) FROM payment_orders
+                              WHERE status = 'approved'), 0),
+                    COALESCE((SELECT SUM(amount_toman) FROM referral_commissions), 0),
+                    (SELECT COUNT(*) FROM bot_users
+                     WHERE referred_by_user_id IS NOT NULL),
+                    (SELECT COUNT(*) FROM payment_orders po
+                     JOIN bot_users bu ON bu.telegram_user_id = po.telegram_user_id
+                     WHERE bu.referred_by_user_id IS NOT NULL
+                       AND po.status = 'approved'),
+                    COALESCE((
+                        SELECT SUM(po.price_toman) / NULLIF(COUNT(DISTINCT po.telegram_user_id), 0)
+                        FROM payment_orders po
+                        JOIN bot_users bu ON bu.telegram_user_id = po.telegram_user_id
+                        WHERE bu.referred_by_user_id IS NOT NULL
+                          AND po.status = 'approved'
+                    ), 0),
+                    COALESCE((SELECT SUM(balance_toman) FROM wallets), 0)",
+                [],
+                |row| {
+                    let referred_users: i64 = row.get(2)?;
+                    let referral_orders: i64 = row.get(3)?;
+                    Ok(FinancialStatistics {
+                        total_sales_toman: row.get(0)?,
+                        total_commissions_toman: row.get(1)?,
+                        referred_users: referred_users.max(0) as u64,
+                        referral_orders: referral_orders.max(0) as u64,
+                        average_referral_revenue_toman: row.get(4)?,
+                        total_wallet_balance_toman: row.get(5)?,
+                    })
+                },
+            )
+    }
+
+    pub fn adjust_all_wallets(
+        &self,
+        action: WalletBulkAction,
+        amount_toman: i64,
+        reason: &str,
+    ) -> rusqlite::Result<WalletBulkAdjustmentSummary> {
+        let reason = reason.trim();
+        if amount_toman <= 0 || reason.is_empty() || reason.chars().count() > 500 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "bulk wallet adjustment requires a positive amount and a 1 to 500 character reason"
+                    .to_owned(),
+            ));
+        }
+
+        let mut database = self.database.lock().expect("database lock poisoned");
+        let transaction = database.transaction()?;
+        let user_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT telegram_user_id FROM bot_users
+                 UNION
+                 SELECT telegram_user_id FROM wallets
+                 ORDER BY telegram_user_id",
+            )?;
+            let user_ids = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            user_ids
+        };
+        let mut summary = WalletBulkAdjustmentSummary {
+            targeted_users: user_ids.len() as u64,
+            changed_users: 0,
+            unchanged_users: 0,
+            total_adjusted_toman: 0,
+        };
+
+        for telegram_user_id in user_ids {
+            let (balance, reserved_balance) = transaction.query_row(
+                "SELECT
+                    COALESCE((SELECT balance_toman FROM wallets WHERE telegram_user_id = ?1), 0),
+                    COALESCE((SELECT SUM(amount_toman) FROM wallet_reservations
+                              WHERE telegram_user_id = ?1), 0)",
+                [&telegram_user_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )?;
+            let (new_balance, adjusted_amount) = match action {
+                WalletBulkAction::Increase => (
+                    balance
+                        .checked_add(amount_toman)
+                        .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, balance))?,
+                    amount_toman,
+                ),
+                WalletBulkAction::Decrease => {
+                    let spendable_balance = balance.saturating_sub(reserved_balance).max(0);
+                    let deduction = amount_toman.min(spendable_balance);
+                    (
+                        balance
+                            .checked_sub(deduction)
+                            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, balance))?,
+                        deduction,
+                    )
+                }
+            };
+            if adjusted_amount == 0 {
+                summary.unchanged_users += 1;
+                continue;
+            }
+
+            let debt = if new_balance < 0 {
+                new_balance
+                    .checked_neg()
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, new_balance))?
+            } else {
+                0
+            };
+            transaction.execute(
+                "INSERT INTO wallets (telegram_user_id, balance_toman, commission_debt_toman)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    balance_toman = excluded.balance_toman,
+                    commission_debt_toman = excluded.commission_debt_toman,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')",
+                params![telegram_user_id, new_balance, debt],
+            )?;
+            let signed_adjustment = match action {
+                WalletBulkAction::Increase => adjusted_amount,
+                WalletBulkAction::Decrease => -adjusted_amount,
+            };
+            transaction.execute(
+                "INSERT INTO wallet_transactions
+                    (telegram_user_id, amount_toman, balance_after_toman,
+                     transaction_type, description)
+                 VALUES (?1, ?2, ?3, 'owner_adjustment', ?4)",
+                params![telegram_user_id, signed_adjustment, new_balance, reason],
+            )?;
+            summary.changed_users += 1;
+            summary.total_adjusted_toman = summary
+                .total_adjusted_toman
+                .checked_add(adjusted_amount)
+                .ok_or(rusqlite::Error::IntegralValueOutOfRange(
+                    0,
+                    summary.total_adjusted_toman,
+                ))?;
+        }
+
+        transaction.commit()?;
+        Ok(summary)
     }
     pub fn broadcast_targets(&self, subscribers_only: bool) -> Result<Vec<u64>> {
         let database = self.database.lock().expect("database lock poisoned");
@@ -510,6 +1064,127 @@ impl AppState {
             .optional()
     }
 
+    pub fn support_username(&self) -> String {
+        self.support_username
+            .lock()
+            .expect("support username lock poisoned")
+            .clone()
+    }
+
+    pub fn set_support_username(&self, support_username: &str) -> rusqlite::Result<()> {
+        if !is_valid_support_username(support_username) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "support username must contain 5 to 32 ASCII letters, digits, or underscores"
+                    .to_owned(),
+            ));
+        }
+        let support_username = support_username.to_ascii_lowercase();
+        let mut database = self.database.lock().expect("database lock poisoned");
+        let transaction = database.transaction()?;
+        transaction.execute(
+            "INSERT INTO support_settings (id, support_username)
+             VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET
+                support_username = excluded.support_username,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')",
+            [&support_username],
+        )?;
+        transaction.commit()?;
+        *self
+            .support_username
+            .lock()
+            .expect("support username lock poisoned") = support_username;
+        Ok(())
+    }
+
+    pub fn required_channels_enabled(&self) -> rusqlite::Result<bool> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT enabled FROM required_channel_settings WHERE id = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+    }
+
+    pub fn set_required_channels_enabled(&self, enabled: bool) -> rusqlite::Result<()> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "UPDATE required_channel_settings
+                 SET enabled = ?1,
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')
+                 WHERE id = 1",
+                [enabled],
+            )?;
+        Ok(())
+    }
+
+    pub fn required_channels(&self) -> rusqlite::Result<Vec<RequiredChannel>> {
+        let database = self.database.lock().expect("database lock poisoned");
+        let mut statement =
+            database.prepare("SELECT username FROM required_channels ORDER BY username")?;
+        let channels = statement
+            .query_map([], |row| {
+                Ok(RequiredChannel {
+                    username: row.get(0)?,
+                })
+            })?
+            .collect();
+        channels
+    }
+
+    pub fn add_required_channel(&self, username: &str) -> rusqlite::Result<bool> {
+        let username = normalize_required_channel_username(username).ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName(
+                "channel username must contain 5 to 32 ASCII letters, digits, or underscores"
+                    .to_owned(),
+            )
+        })?;
+        let mut database = self.database.lock().expect("database lock poisoned");
+        let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM required_channels WHERE username = ?1)",
+            [&username],
+            |row| row.get(0),
+        )?;
+        if existing {
+            return Ok(false);
+        }
+        let channel_count: usize =
+            transaction.query_row("SELECT COUNT(*) FROM required_channels", [], |row| {
+                row.get(0)
+            })?;
+        if channel_count >= MAX_REQUIRED_CHANNELS {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "at most {MAX_REQUIRED_CHANNELS} required channels may be configured"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO required_channels (username) VALUES (?1)",
+            [&username],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn remove_required_channel(&self, username: &str) -> rusqlite::Result<bool> {
+        let username = normalize_required_channel_username(username).ok_or_else(|| {
+            rusqlite::Error::InvalidParameterName("invalid channel username".to_owned())
+        })?;
+        let changed = self
+            .database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "DELETE FROM required_channels WHERE username = ?1",
+                [&username],
+            )?;
+        Ok(changed != 0)
+    }
+
     pub fn sales_status(&self) -> rusqlite::Result<(bool, bool)> {
         self.database
             .lock()
@@ -549,6 +1224,46 @@ impl AppState {
                     renewals_enabled = excluded.renewals_enabled,
                     updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')",
                 [enabled],
+            )?;
+        Ok(())
+    }
+
+    pub fn referral_status(&self) -> rusqlite::Result<(bool, u8)> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT enabled, percent FROM referral_settings WHERE id = 1",
+                [],
+                |row| {
+                    let percent: i64 = row.get(1)?;
+                    Ok((row.get(0)?, percent as u8))
+                },
+            )
+    }
+
+    pub fn set_referrals_enabled(&self, enabled: bool) -> rusqlite::Result<()> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "UPDATE referral_settings SET enabled = ?1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')
+                 WHERE id = 1",
+                [enabled],
+            )?;
+        Ok(())
+    }
+
+    pub fn set_referral_percent(&self, percent: u8) -> rusqlite::Result<()> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "UPDATE referral_settings SET percent = ?1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')
+                 WHERE id = 1",
+                [percent],
             )?;
         Ok(())
     }
@@ -693,9 +1408,22 @@ impl AppState {
     pub fn create_tariff_payment_order(
         &self,
         order: NewTariffPaymentOrder<'_>,
-    ) -> rusqlite::Result<Option<CreatedPaymentOrder>> {
+    ) -> Result<Option<CreatedPaymentOrder>, CreateTariffPaymentOrderError> {
         let mut database = self.database.lock().expect("database lock poisoned");
-        let transaction = database.transaction()?;
+        let transaction = database.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let telegram_user_id = order.telegram_user_id.to_string();
+        let has_order_awaiting_admin_review = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM payment_orders
+                WHERE telegram_user_id = ?1
+                  AND status IN ('pending_review', 'approving')
+             )",
+            [&telegram_user_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_order_awaiting_admin_review {
+            return Err(CreateTariffPaymentOrderError::OrderAwaitingAdminReview);
+        }
         let tariff = transaction
             .query_row(
                 "SELECT volume_gb, price_toman FROM subscription_tariffs
@@ -722,14 +1450,9 @@ impl AppState {
             )
         })?;
 
-        let telegram_user_id = order.telegram_user_id.to_string();
         transaction.execute(
             "UPDATE payment_orders SET status = 'cancelled'
-             WHERE telegram_user_id = ?1 AND (
-                 status = 'awaiting_receipt'
-                 OR (status = 'pending_review' AND payment_method = 'wallet'
-                     AND amount_due_toman = 0)
-             )",
+             WHERE telegram_user_id = ?1 AND status = 'awaiting_receipt'",
             [&telegram_user_id],
         )?;
         transaction.execute(
@@ -926,6 +1649,17 @@ impl AppState {
         messages
     }
 
+    pub fn delete_payment_review_messages(&self, order_id: i64) -> rusqlite::Result<()> {
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "DELETE FROM payment_review_messages WHERE order_id = ?1",
+                [order_id],
+            )?;
+        Ok(())
+    }
+
     pub fn reset_order_receipt(&self, order_id: i64) -> rusqlite::Result<()> {
         self.database
             .lock()
@@ -1107,6 +1841,11 @@ impl AppState {
                 ],
             )?;
         }
+        let (referrals_enabled, referral_percent) = transaction.query_row(
+            "SELECT enabled, percent FROM referral_settings WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, i64>(1)?)),
+        )?;
         let referrer_id = transaction
             .query_row(
                 "SELECT referred_by_user_id FROM bot_users WHERE telegram_user_id = ?1",
@@ -1115,55 +1854,57 @@ impl AppState {
             )
             .optional()?
             .flatten();
-        if let Some(referrer_id) = referrer_id {
-            let exact_commission = price_toman
-                .checked_mul(15)
-                .ok_or(rusqlite::Error::IntegralValueOutOfRange(1, price_toman))?
-                / 100;
-            let commission = round_commission_to_thousand(exact_commission);
-            if commission > 0 {
-                let inserted = transaction.execute(
-                    "INSERT OR IGNORE INTO referral_commissions
+        if referrals_enabled && referral_percent > 0 {
+            if let Some(referrer_id) = referrer_id {
+                let exact_commission = price_toman
+                    .checked_mul(referral_percent)
+                    .ok_or(rusqlite::Error::IntegralValueOutOfRange(1, price_toman))?
+                    / 100;
+                let commission = round_commission_to_thousand(exact_commission);
+                if commission > 0 {
+                    let inserted = transaction.execute(
+                        "INSERT OR IGNORE INTO referral_commissions
                         (order_id, referrer_user_id, invited_user_id, amount_toman)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![order_id, referrer_id, telegram_user_id, commission],
-                )?;
-                if inserted == 1 {
-                    let previous_balance = transaction
-                        .query_row(
-                            "SELECT balance_toman FROM wallets WHERE telegram_user_id = ?1",
-                            [&referrer_id],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .optional()?
-                        .unwrap_or(0);
-                    let new_balance = previous_balance.checked_add(commission).ok_or(
-                        rusqlite::Error::IntegralValueOutOfRange(0, previous_balance),
+                        params![order_id, referrer_id, telegram_user_id, commission],
                     )?;
-                    let debt = if new_balance < 0 {
-                        new_balance
-                            .checked_neg()
-                            .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, new_balance))?
-                    } else {
-                        0
-                    };
-                    transaction.execute(
-                        "INSERT INTO wallets
+                    if inserted == 1 {
+                        let previous_balance = transaction
+                            .query_row(
+                                "SELECT balance_toman FROM wallets WHERE telegram_user_id = ?1",
+                                [&referrer_id],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .optional()?
+                            .unwrap_or(0);
+                        let new_balance = previous_balance.checked_add(commission).ok_or(
+                            rusqlite::Error::IntegralValueOutOfRange(0, previous_balance),
+                        )?;
+                        let debt = if new_balance < 0 {
+                            new_balance
+                                .checked_neg()
+                                .ok_or(rusqlite::Error::IntegralValueOutOfRange(0, new_balance))?
+                        } else {
+                            0
+                        };
+                        transaction.execute(
+                            "INSERT INTO wallets
                             (telegram_user_id, balance_toman, commission_debt_toman)
                          VALUES (?1, ?2, ?3)
                          ON CONFLICT(telegram_user_id) DO UPDATE SET
                             balance_toman = excluded.balance_toman,
                             commission_debt_toman = excluded.commission_debt_toman,
                             updated_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30')",
-                        params![referrer_id, new_balance, debt],
-                    )?;
-                    transaction.execute(
-                        "INSERT INTO wallet_transactions
+                            params![referrer_id, new_balance, debt],
+                        )?;
+                        transaction.execute(
+                            "INSERT INTO wallet_transactions
                             (telegram_user_id, amount_toman, balance_after_toman,
                              transaction_type, order_id)
                          VALUES (?1, ?2, ?3, 'referral_commission', ?4)",
-                        params![referrer_id, commission, new_balance, order_id],
-                    )?;
+                            params![referrer_id, commission, new_balance, order_id],
+                        )?;
+                    }
                 }
             }
         }
@@ -1376,6 +2117,67 @@ fn migrate_commerce_settings(database: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn migrate_support_settings(database: &Connection) -> rusqlite::Result<()> {
+    database.execute_batch(
+        "CREATE TABLE IF NOT EXISTS support_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            support_username TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
+        );
+        INSERT OR IGNORE INTO support_settings (id, support_username)
+        VALUES (1, 'ipublicsupport');",
+    )
+}
+
+fn migrate_required_channels(database: &Connection) -> rusqlite::Result<()> {
+    let had_required_channels_table: bool = database.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'required_channels'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    database.execute_batch(
+        "CREATE TABLE IF NOT EXISTS required_channel_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
+        );
+        INSERT OR IGNORE INTO required_channel_settings (id) VALUES (1);
+        CREATE TABLE IF NOT EXISTS required_channels (
+            username TEXT PRIMARY KEY NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
+        );",
+    )?;
+    if !had_required_channels_table {
+        database.execute(
+            "INSERT OR IGNORE INTO required_channels (username) VALUES ('hakungvpn')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn read_support_username(database: &Connection) -> rusqlite::Result<String> {
+    let support_username: String = database.query_row(
+        "SELECT support_username FROM support_settings WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if !is_valid_support_username(&support_username) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(support_username.to_ascii_lowercase())
+}
+
+fn is_valid_support_username(support_username: &str) -> bool {
+    (5..=32).contains(&support_username.len())
+        && support_username
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'_')
+}
+
 fn migrate_bot_user_referrals(database: &Connection) -> rusqlite::Result<()> {
     let columns = database
         .prepare("PRAGMA table_info(bot_users)")?
@@ -1390,6 +2192,47 @@ fn migrate_bot_user_referrals(database: &Connection) -> rusqlite::Result<()> {
     database.execute(
         "CREATE INDEX IF NOT EXISTS idx_bot_users_referred_by
          ON bot_users (referred_by_user_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_bot_user_profile(database: &Connection) -> rusqlite::Result<()> {
+    let columns = database
+        .prepare("PRAGMA table_info(bot_users)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for column in ["username", "first_name"] {
+        if !columns.iter().any(|existing| existing == column) {
+            database.execute(
+                &format!("ALTER TABLE bot_users ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_wallet_transaction_descriptions(database: &Connection) -> rusqlite::Result<()> {
+    let columns = database
+        .prepare("PRAGMA table_info(wallet_transactions)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|column| column == "description") {
+        database.execute(
+            "ALTER TABLE wallet_transactions ADD COLUMN description TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_financial_transaction_constraints(database: &Connection) -> rusqlite::Result<()> {
+    database.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_transactions_unique_order_type
+         ON wallet_transactions (order_id, transaction_type)
+         WHERE order_id IS NOT NULL
+           AND transaction_type IN ('wallet_purchase', 'referral_commission')",
         [],
     )?;
     Ok(())
@@ -1552,6 +2395,51 @@ fn payment_order_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaymentOr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_backup_test_path() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "falconbot-test-backup-{}-{}.sqlite3",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn database_backup_can_be_restored_and_invalid_backup_is_rejected() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.set_referral_percent(24).unwrap();
+        let backup_path = temporary_backup_test_path();
+        let rollback_path = temporary_backup_test_path();
+        state.create_database_backup(&backup_path).unwrap();
+
+        state.set_referral_percent(12).unwrap();
+        state.set_referrals_enabled(false).unwrap();
+        state
+            .restore_database_backup(&backup_path, &rollback_path)
+            .unwrap();
+        assert_eq!(state.referral_status().unwrap(), (true, 24));
+
+        let invalid_path = temporary_backup_test_path();
+        fs::write(&invalid_path, b"not a sqlite database").unwrap();
+        assert!(state
+            .restore_database_backup(&invalid_path, &rollback_path)
+            .is_err());
+        assert_eq!(state.referral_status().unwrap(), (true, 24));
+
+        fs::remove_file(backup_path).unwrap();
+        fs::remove_file(rollback_path).unwrap();
+        fs::remove_file(invalid_path).unwrap();
+    }
+
+    #[test]
+    fn disk_space_usage_reports_nonzero_filesystem_capacity() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        let usage = state.disk_space_usage().unwrap();
+
+        assert!(usage.total_bytes > 0);
+        assert!(usage.free_bytes <= usage.total_bytes);
+    }
 
     #[test]
     fn subscription_tariffs_are_seeded_and_read_from_the_database() {
@@ -1757,6 +2645,49 @@ mod tests {
     }
 
     #[test]
+    fn users_can_be_searched_by_id_or_username_with_referral_details() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.record_bot_user(10).unwrap();
+        state.record_bot_user_with_referrer(20, Some(10)).unwrap();
+        state
+            .update_bot_user_profile(10, Some("inviter"), "Inviter")
+            .unwrap();
+        state
+            .update_bot_user_profile(20, Some("invitee"), "Invitee")
+            .unwrap();
+
+        assert_eq!(
+            state.search_bot_users("@invitee").unwrap(),
+            vec![BotUserSearchResult {
+                telegram_user_id: 20,
+                username: Some("invitee".into()),
+                first_name: Some("Invitee".into()),
+            }]
+        );
+        assert_eq!(
+            state.search_bot_users("20").unwrap()[0].telegram_user_id,
+            20
+        );
+        assert_eq!(
+            state.bot_user_details(20).unwrap(),
+            Some(BotUserDetails {
+                telegram_user_id: 20,
+                username: Some("invitee".into()),
+                first_name: Some("Invitee".into()),
+                referrer_user_id: Some(10),
+                referrer_username: Some("inviter".into()),
+                referrer_first_name: Some("Inviter".into()),
+                referral_count: 0,
+                commissions_paid_toman: 0,
+            })
+        );
+        assert_eq!(
+            state.bot_user_details(10).unwrap().unwrap().referral_count,
+            1
+        );
+    }
+
+    #[test]
     fn referral_migration_preserves_existing_bot_users() {
         let database = Connection::open_in_memory().unwrap();
         database
@@ -1772,6 +2703,7 @@ mod tests {
             .unwrap();
 
         migrate_bot_user_referrals(&database).unwrap();
+        migrate_bot_user_profile(&database).unwrap();
 
         let (user_id, referrer_id): (String, Option<String>) = database
             .query_row(
@@ -1782,6 +2714,15 @@ mod tests {
             .unwrap();
         assert_eq!(user_id, "42");
         assert_eq!(referrer_id, None);
+        let profile_columns = database
+            .prepare("PRAGMA table_info(bot_users)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(profile_columns.iter().any(|column| column == "username"));
+        assert!(profile_columns.iter().any(|column| column == "first_name"));
     }
 
     #[test]
@@ -1834,6 +2775,40 @@ mod tests {
     }
 
     #[test]
+    fn wallet_transaction_description_migration_preserves_existing_rows() {
+        let database = Connection::open_in_memory().unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE wallet_transactions (
+                    id INTEGER PRIMARY KEY,
+                    telegram_user_id TEXT NOT NULL,
+                    amount_toman INTEGER NOT NULL,
+                    balance_after_toman INTEGER NOT NULL,
+                    transaction_type TEXT NOT NULL,
+                    order_id INTEGER,
+                    created_at TEXT NOT NULL
+                 );
+                 INSERT INTO wallet_transactions
+                    (id, telegram_user_id, amount_toman, balance_after_toman,
+                     transaction_type, order_id, created_at)
+                 VALUES (1, '42', 1000, 1000, 'owner_adjustment', NULL, '2026-01-01');",
+            )
+            .unwrap();
+
+        migrate_wallet_transaction_descriptions(&database).unwrap();
+        let (amount, description): (i64, Option<String>) = database
+            .query_row(
+                "SELECT amount_toman, description FROM wallet_transactions WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(amount, 1_000);
+        assert_eq!(description, None);
+    }
+
+    #[test]
     fn successful_payment_credits_referrer_once_at_fifteen_percent() {
         let state = AppState::new(UserId(1), ":memory:").unwrap();
         state.record_bot_user(10).unwrap();
@@ -1860,6 +2835,146 @@ mod tests {
             .is_err());
         assert_eq!(state.wallet_summary(10).unwrap(), (17_000, 0));
         assert_eq!(state.referral_summary(10).unwrap(), (1, 17_000));
+        assert_eq!(state.bot_user_statistics().unwrap(), (2, 1, 17_000));
+        assert_eq!(state.wallet_statistics().unwrap(), (17_000, 17_000));
+    }
+
+    #[test]
+    fn referral_ledger_is_unique_per_order_and_payment_completion_is_atomic() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.record_bot_user(10).unwrap();
+        state.record_bot_user_with_referrer(20, Some(10)).unwrap();
+        let order_id = state
+            .create_payment_order(NewPaymentOrder {
+                telegram_user_id: 20,
+                account_name: "Invited User",
+                telegram_username: None,
+                panel_username: "haku-200001",
+                plan_gb: 10,
+                price_toman: 115_000,
+                is_renewal: false,
+            })
+            .unwrap();
+        state.submit_order_receipt(order_id, 20, "receipt").unwrap();
+        state.claim_payment_order(order_id).unwrap().unwrap();
+
+        {
+            let database = state.database.lock().unwrap();
+            database
+                .execute(
+                    "INSERT INTO wallet_transactions
+                        (telegram_user_id, amount_toman, balance_after_toman,
+                         transaction_type, order_id)
+                     VALUES ('10', 1000, 1000, 'referral_commission', ?1)",
+                    [order_id],
+                )
+                .unwrap();
+            assert!(database
+                .execute(
+                    "INSERT INTO wallet_transactions
+                        (telegram_user_id, amount_toman, balance_after_toman,
+                         transaction_type, order_id)
+                     VALUES ('10', 1000, 2000, 'referral_commission', ?1)",
+                    [order_id],
+                )
+                .is_err());
+        }
+
+        assert!(state
+            .complete_payment_order(order_id, 20, "haku-200001")
+            .is_err());
+        let database = state.database.lock().unwrap();
+        let (status, commission_count): (String, i64) = database
+            .query_row(
+                "SELECT status,
+                        (SELECT COUNT(*) FROM referral_commissions WHERE order_id = ?1)
+                 FROM payment_orders WHERE id = ?1",
+                [order_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "approving");
+        assert_eq!(commission_count, 0);
+        drop(database);
+        assert_eq!(state.wallet_summary(10).unwrap(), (0, 0));
+
+        state
+            .database
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM wallet_transactions
+                 WHERE order_id = ?1 AND transaction_type = 'referral_commission'",
+                [order_id],
+            )
+            .unwrap();
+        state.release_payment_order(order_id).unwrap();
+        state.claim_payment_order(order_id).unwrap().unwrap();
+        state
+            .complete_payment_order(order_id, 20, "haku-200001")
+            .unwrap();
+        assert_eq!(state.wallet_summary(10).unwrap(), (17_000, 0));
+    }
+
+    #[test]
+    fn referral_settings_persist_and_apply_custom_commission_rate() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        assert_eq!(state.referral_status().unwrap(), (true, 15));
+        state.set_referral_percent(20).unwrap();
+        state.record_bot_user(10).unwrap();
+        state.record_bot_user_with_referrer(20, Some(10)).unwrap();
+        let order_id = state
+            .create_payment_order(NewPaymentOrder {
+                telegram_user_id: 20,
+                account_name: "Invited User",
+                telegram_username: None,
+                panel_username: "haku-200001",
+                plan_gb: 10,
+                price_toman: 115_000,
+                is_renewal: false,
+            })
+            .unwrap();
+        state.submit_order_receipt(order_id, 20, "receipt").unwrap();
+        state.claim_payment_order(order_id).unwrap().unwrap();
+        state
+            .complete_payment_order(order_id, 20, "haku-200001")
+            .unwrap();
+
+        assert_eq!(state.referral_status().unwrap(), (true, 20));
+        assert_eq!(state.wallet_summary(10).unwrap(), (23_000, 0));
+    }
+
+    #[test]
+    fn disabled_referrals_skip_new_attribution_and_commissions() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.record_bot_user(10).unwrap();
+        state.set_referrals_enabled(false).unwrap();
+        state.record_bot_user_with_referrer(20, Some(10)).unwrap();
+        assert_eq!(state.referral_summary(10).unwrap(), (0, 0));
+
+        state.set_referrals_enabled(true).unwrap();
+        state.record_bot_user_with_referrer(30, Some(10)).unwrap();
+        state.set_referrals_enabled(false).unwrap();
+        let order_id = state
+            .create_payment_order(NewPaymentOrder {
+                telegram_user_id: 30,
+                account_name: "Invited User",
+                telegram_username: None,
+                panel_username: "haku-300001",
+                plan_gb: 10,
+                price_toman: 115_000,
+                is_renewal: false,
+            })
+            .unwrap();
+        state.submit_order_receipt(order_id, 30, "receipt").unwrap();
+        state.claim_payment_order(order_id).unwrap().unwrap();
+        state
+            .complete_payment_order(order_id, 30, "haku-300001")
+            .unwrap();
+
+        assert_eq!(state.referral_status().unwrap(), (false, 15));
+        assert_eq!(state.referral_summary(10).unwrap(), (1, 0));
+        assert_eq!(state.wallet_summary(10).unwrap(), (0, 0));
     }
 
     #[test]
@@ -2059,7 +3174,12 @@ mod tests {
     fn owner_wallet_adjustment_sets_exact_signed_balance_and_is_idempotent() {
         let state = AppState::new(UserId(1), ":memory:").unwrap();
 
-        assert_eq!(state.set_wallet_balance(42, -25_000).unwrap(), 0);
+        assert_eq!(
+            state
+                .set_wallet_balance_with_reason(42, -25_000, "اصلاح شارژ اشتباه")
+                .unwrap(),
+            0
+        );
         assert_eq!(state.wallet_summary(42).unwrap(), (-25_000, 25_000));
         assert_eq!(state.set_wallet_balance(42, -25_000).unwrap(), -25_000);
         assert_eq!(state.wallet_summary(42).unwrap(), (-25_000, 25_000));
@@ -2076,6 +3196,188 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transactions, 1);
+        let description: String = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT description FROM wallet_transactions
+                 WHERE telegram_user_id = '42' AND transaction_type = 'owner_adjustment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(description, "اصلاح شارژ اشتباه");
+    }
+
+    #[test]
+    fn wallet_statistics_sum_signed_balances_and_paid_commissions() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.set_wallet_balance(10, 12_000).unwrap();
+        state.set_wallet_balance(20, -2_000).unwrap();
+        state
+            .database
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO referral_commissions
+                    (order_id, referrer_user_id, invited_user_id, amount_toman)
+                 VALUES (1, '10', '20', 5_000)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(state.wallet_statistics().unwrap(), (10_000, 5_000));
+    }
+
+    #[test]
+    fn financial_statistics_count_only_approved_orders_and_average_referral_revenue() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.record_bot_user(10).unwrap();
+        for user_id in [20, 30, 40] {
+            state
+                .record_bot_user_with_referrer(user_id, Some(10))
+                .unwrap();
+        }
+        state.record_bot_user(50).unwrap();
+
+        let approve_order = |user_id, price_toman, panel_username: &str| {
+            let order_id = state
+                .create_payment_order(NewPaymentOrder {
+                    telegram_user_id: user_id,
+                    account_name: "Test User",
+                    telegram_username: None,
+                    panel_username,
+                    plan_gb: 10,
+                    price_toman,
+                    is_renewal: false,
+                })
+                .unwrap();
+            state
+                .submit_order_receipt(order_id, user_id, "receipt")
+                .unwrap();
+            state.claim_payment_order(order_id).unwrap().unwrap();
+            state
+                .complete_payment_order(order_id, user_id, panel_username)
+                .unwrap();
+        };
+        approve_order(20, 20_000, "haku-200001");
+        approve_order(20, 40_000, "haku-200002");
+        approve_order(30, 60_000, "haku-300001");
+        approve_order(50, 70_000, "haku-500001");
+
+        state
+            .create_payment_order(NewPaymentOrder {
+                telegram_user_id: 40,
+                account_name: "Test User",
+                telegram_username: None,
+                panel_username: "haku-400001",
+                plan_gb: 10,
+                price_toman: 500_000,
+                is_renewal: false,
+            })
+            .unwrap();
+        state.set_wallet_balance(50, 5_000).unwrap();
+
+        assert_eq!(
+            state.financial_statistics().unwrap(),
+            FinancialStatistics {
+                total_sales_toman: 190_000,
+                total_commissions_toman: 18_000,
+                referred_users: 3,
+                referral_orders: 3,
+                average_referral_revenue_toman: 60_000,
+                total_wallet_balance_toman: 23_000,
+            }
+        );
+    }
+
+    #[test]
+    fn bulk_wallet_credit_and_debit_records_each_users_reason() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        for user_id in [10, 20, 30, 40] {
+            state.record_bot_user(user_id).unwrap();
+        }
+        state.set_wallet_balance(10, 10_000).unwrap();
+        state.set_wallet_balance(20, 3_000).unwrap();
+
+        let credit = state
+            .adjust_all_wallets(WalletBulkAction::Increase, 5_000, "هدیه مناسبتی")
+            .unwrap();
+        assert_eq!(
+            credit,
+            WalletBulkAdjustmentSummary {
+                targeted_users: 4,
+                changed_users: 4,
+                unchanged_users: 0,
+                total_adjusted_toman: 20_000,
+            }
+        );
+        assert_eq!(state.wallet_summary(30).unwrap(), (5_000, 0));
+
+        state.record_bot_user(50).unwrap();
+        let debit = state
+            .adjust_all_wallets(WalletBulkAction::Decrease, 6_000, "اصلاح هدیه")
+            .unwrap();
+        assert_eq!(
+            debit,
+            WalletBulkAdjustmentSummary {
+                targeted_users: 5,
+                changed_users: 4,
+                unchanged_users: 1,
+                total_adjusted_toman: 22_000,
+            }
+        );
+        assert_eq!(state.wallet_summary(10).unwrap(), (9_000, 0));
+        assert_eq!(state.wallet_summary(20).unwrap(), (2_000, 0));
+        assert_eq!(state.wallet_summary(30).unwrap(), (0, 0));
+        assert_eq!(state.wallet_summary(50).unwrap(), (0, 0));
+
+        let reasons: i64 = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM wallet_transactions
+                 WHERE description IN ('هدیه مناسبتی', 'اصلاح هدیه')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reasons, 8);
+    }
+
+    #[test]
+    fn bulk_wallet_debit_preserves_pending_order_reservations() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        let tariff_id = state
+            .active_subscription_tariffs()
+            .unwrap()
+            .into_iter()
+            .find(|tariff| tariff.volume_gb == 10)
+            .unwrap()
+            .id;
+        state.set_wallet_balance(42, 100_000).unwrap();
+        let order = state
+            .create_tariff_payment_order(NewTariffPaymentOrder {
+                telegram_user_id: 42,
+                account_name: "Test User",
+                telegram_username: None,
+                panel_username: "haku-420001",
+                tariff_id,
+                use_wallet: true,
+                is_renewal: false,
+            })
+            .unwrap()
+            .unwrap();
+
+        let summary = state
+            .adjust_all_wallets(WalletBulkAction::Decrease, 100_000, "کاهش گروهی")
+            .unwrap();
+
+        assert_eq!(state.wallet_summary(42).unwrap(), (60_000, 0));
+        assert_eq!(summary.total_adjusted_toman, 40_000);
+        assert!(state.claim_payment_order(order.id).unwrap().is_some());
     }
 
     #[test]
@@ -2261,6 +3563,54 @@ mod tests {
     }
 
     #[test]
+    fn new_orders_are_blocked_while_existing_order_waits_for_admin() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        let tariff_id = state
+            .active_subscription_tariffs()
+            .unwrap()
+            .into_iter()
+            .find(|tariff| tariff.volume_gb == 10)
+            .unwrap()
+            .id;
+        let new_order = || NewTariffPaymentOrder {
+            telegram_user_id: 42,
+            account_name: "Test User",
+            telegram_username: Some("test"),
+            panel_username: "Falcon🦅-420001",
+            tariff_id,
+            use_wallet: false,
+            is_renewal: false,
+        };
+        let order = state
+            .create_tariff_payment_order(new_order())
+            .unwrap()
+            .unwrap();
+        assert!(state.submit_order_receipt(order.id, 42, "receipt").unwrap());
+
+        assert!(matches!(
+            state.create_tariff_payment_order(new_order()),
+            Err(CreateTariffPaymentOrderError::OrderAwaitingAdminReview)
+        ));
+        let order_count: i64 = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM payment_orders WHERE telegram_user_id = '42'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(order_count, 1);
+
+        state.claim_payment_order(order.id).unwrap().unwrap();
+        assert!(matches!(
+            state.create_tariff_payment_order(new_order()),
+            Err(CreateTariffPaymentOrderError::OrderAwaitingAdminReview)
+        ));
+    }
+
+    #[test]
     fn payment_review_messages_are_tracked_for_each_reviewer() {
         let state = AppState::new(UserId(1), ":memory:").unwrap();
         let order_id = state
@@ -2291,6 +3641,28 @@ mod tests {
         assert_eq!(messages[1].reviewer_user_id, 2);
         assert_eq!(messages[1].message_id, 202);
         assert!(!messages[1].is_text);
+
+        let other_order_id = state
+            .create_payment_order(NewPaymentOrder {
+                telegram_user_id: 43,
+                account_name: "Another User",
+                telegram_username: None,
+                panel_username: "haku-430001",
+                plan_gb: 10,
+                price_toman: 40_000,
+                is_renewal: false,
+            })
+            .unwrap();
+        state
+            .record_payment_review_message(other_order_id, 1, 303, "another order", true)
+            .unwrap();
+
+        state.delete_payment_review_messages(order_id).unwrap();
+        assert!(state.payment_review_messages(order_id).unwrap().is_empty());
+        assert_eq!(
+            state.payment_review_messages(other_order_id).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -2306,6 +3678,132 @@ mod tests {
             state.payment_details().unwrap(),
             Some(("6037997512345678".into(), "Test Account Owner".into()))
         );
+    }
+
+    #[test]
+    fn support_username_defaults_and_persists_owner_changes() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+
+        assert_eq!(state.support_username(), "ipublicsupport");
+        state.set_support_username("falcon_help").unwrap();
+        assert_eq!(state.support_username(), "falcon_help");
+        let stored_username: String = state
+            .database
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT support_username FROM support_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_username, "falcon_help");
+    }
+
+    #[test]
+    fn required_channel_settings_default_to_legacy_channel_and_support_management() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+
+        assert!(state.required_channels_enabled().unwrap());
+        assert_eq!(
+            state.required_channels().unwrap(),
+            vec![RequiredChannel {
+                username: "hakungvpn".into()
+            }]
+        );
+        assert!(state.add_required_channel("@Falcon_News").unwrap());
+        assert!(!state.add_required_channel("falcon_news").unwrap());
+        assert_eq!(
+            state.required_channels().unwrap(),
+            vec![
+                RequiredChannel {
+                    username: "falcon_news".into()
+                },
+                RequiredChannel {
+                    username: "hakungvpn".into()
+                }
+            ]
+        );
+
+        state.set_required_channels_enabled(false).unwrap();
+        assert!(!state.required_channels_enabled().unwrap());
+        assert!(state.remove_required_channel("@FALCON_NEWS").unwrap());
+        assert!(!state.remove_required_channel("falcon_news").unwrap());
+        assert_eq!(
+            state.required_channels().unwrap(),
+            vec![RequiredChannel {
+                username: "hakungvpn".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn legacy_channel_migration_does_not_restore_removed_channels() {
+        let database = Connection::open_in_memory().unwrap();
+        migrate_required_channels(&database).unwrap();
+        database
+            .execute("DELETE FROM required_channels", [])
+            .unwrap();
+
+        migrate_required_channels(&database).unwrap();
+
+        let channel_count: usize = database
+            .query_row("SELECT COUNT(*) FROM required_channels", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(channel_count, 0);
+    }
+
+    #[test]
+    fn restoring_legacy_backup_migrates_required_channels() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        let backup_path = temporary_backup_test_path();
+        let rollback_path = temporary_backup_test_path();
+        state.create_database_backup(&backup_path).unwrap();
+        Connection::open(&backup_path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE required_channels;
+                 DROP TABLE required_channel_settings;",
+            )
+            .unwrap();
+
+        state
+            .restore_database_backup(&backup_path, &rollback_path)
+            .unwrap();
+
+        assert!(state.required_channels_enabled().unwrap());
+        assert_eq!(
+            state.required_channels().unwrap(),
+            vec![RequiredChannel {
+                username: "hakungvpn".into()
+            }]
+        );
+        fs::remove_file(backup_path).unwrap();
+        fs::remove_file(rollback_path).unwrap();
+    }
+
+    #[test]
+    fn restoring_legacy_backup_migrates_support_username_setting() {
+        let state = AppState::new(UserId(1), ":memory:").unwrap();
+        state.set_support_username("backup_support").unwrap();
+        let backup_path = temporary_backup_test_path();
+        let rollback_path = temporary_backup_test_path();
+        state.create_database_backup(&backup_path).unwrap();
+        Connection::open(&backup_path)
+            .unwrap()
+            .execute("DROP TABLE support_settings", [])
+            .unwrap();
+
+        state.set_support_username("current_support").unwrap();
+        state
+            .restore_database_backup(&backup_path, &rollback_path)
+            .unwrap();
+
+        assert_eq!(state.support_username(), "ipublicsupport");
+        fs::remove_file(backup_path).unwrap();
+        fs::remove_file(rollback_path).unwrap();
     }
 
     #[test]

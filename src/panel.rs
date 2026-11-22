@@ -745,7 +745,7 @@ fn suggest_unused_username(telegram_user_id: u64, used_usernames: &[String]) -> 
     let start = rand::random_range(0..1000);
     (0..1000).find_map(|offset| {
         let suffix = (start + offset) % 1000;
-        let username = format!("haku-{prefix}{suffix:03}");
+        let username = format!("Falcon🦅-{prefix}{suffix:03}");
         (!used_usernames.contains(&username)).then_some(username)
     })
 }
@@ -915,19 +915,20 @@ mod tests {
     #[test]
     fn generated_username_contains_id_prefix_and_six_digits() {
         let username = suggest_unused_username(123_456_789, &[]).unwrap();
-        let suffix = username.strip_prefix("haku-123").unwrap();
+        let suffix = username.strip_prefix("Falcon🦅-").unwrap();
 
-        assert_eq!(suffix.len(), 3);
+        assert!(username.starts_with("Falcon🦅-123"));
+        assert_eq!(suffix.len(), 6);
         assert!(suffix.chars().all(|digit| digit.is_ascii_digit()));
     }
 
     #[test]
     fn new_username_avoids_existing_client_names() {
-        let used = vec!["haku-123000".to_owned(), "haku-123001".to_owned()];
+        let used = vec!["Falcon🦅-123000".to_owned(), "Falcon🦅-123001".to_owned()];
 
         let username = suggest_unused_username(123_456_789, &used).unwrap();
 
-        assert!(username.starts_with("haku-123"));
+        assert!(username.starts_with("Falcon🦅-123"));
         assert!(!used.contains(&username));
     }
 
