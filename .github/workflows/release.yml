@@ -1,0 +1,57 @@
+name: Linux x86_64 release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Linux x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64-release
+
+      - name: Build optimized release binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/falconbot-release"
+          install -m 0755 \
+            target/x86_64-unknown-linux-gnu/release/foxngbot-rust \
+            "$RUNNER_TEMP/falconbot-release/falconbot-linux-x86_64"
+          install -m 0644 scripts/install.sh "$RUNNER_TEMP/falconbot-release/install.sh"
+          install -m 0644 scripts/update.sh "$RUNNER_TEMP/falconbot-release/update.sh"
+          cd "$RUNNER_TEMP/falconbot-release"
+          sha256sum falconbot-linux-x86_64 install.sh update.sh > SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/falconbot-release/falconbot-linux-x86_64" \
+            "$RUNNER_TEMP/falconbot-release/install.sh" \
+            "$RUNNER_TEMP/falconbot-release/update.sh" \
+            "$RUNNER_TEMP/falconbot-release/SHA256SUMS" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
