@@ -6,7 +6,7 @@ use chrono::{Datelike, Timelike};
 use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use serde::{Deserialize, Serialize};
-use state::{AppState, NewPaymentOrder, PaymentOrder, SetupState};
+use state::{AppState, NewTariffPaymentOrder, PaymentOrder, SetupState, SubscriptionTariff};
 use std::{
     env,
     fs::{self, OpenOptions},
@@ -20,8 +20,8 @@ use teloxide::{
     dptree,
     prelude::*,
     types::{
-        FileId, InlineKeyboardButton, InlineKeyboardButtonKind, InlineKeyboardMarkup, InputFile,
-        MessageId, ParseMode, Update, User,
+        CopyTextButton, FileId, InlineKeyboardButton, InlineKeyboardButtonKind,
+        InlineKeyboardMarkup, InputFile, MessageId, ParseMode, Update, User,
     },
 };
 use url::Url;
@@ -29,7 +29,6 @@ use zeroize::Zeroizing;
 
 const REQUIRED_CHANNEL: &str = "@HakuNGVPN";
 const REQUIRED_CHANNEL_URL: &str = "https://t.me/HakuNGVPN";
-const MONTHLY_PLAN_GB: [u16; 10] = [10, 20, 30, 50, 80, 100, 150, 200, 250, 300];
 const USER_MENU_PROMPT: &str = "از منوی زیر انتخاب کن 👇🏻";
 
 fn start_user_menu_prompt(first_name: &str) -> String {
@@ -69,6 +68,8 @@ struct UserMenuButton {
     callback_data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    copy_text: Option<CopyTextButton>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -149,6 +150,7 @@ fn user_menu_rich_message(prompt: &str) -> UserMenuRichMessage {
         text: text.to_owned(),
         callback_data: Some(callback_data.to_owned()),
         url: None,
+        copy_text: None,
         style,
     };
 
@@ -201,13 +203,39 @@ fn text_message_rich_message(
     text: &str,
     keyboard: &InlineKeyboardMarkup,
 ) -> Result<UserMenuRichMessage> {
-    let mut blocks = vec![UserMenuBlock::Paragraph {
-        text: UserMenuRichText::Plain(text.to_owned()),
-    }];
+    text_message_rich_message_with_bold_lines(text, keyboard, &[])
+}
+
+fn text_message_rich_message_with_bold_lines(
+    text: &str,
+    keyboard: &InlineKeyboardMarkup,
+    bold_line_prefixes: &[&str],
+) -> Result<UserMenuRichMessage> {
+    let mut blocks = if bold_line_prefixes.is_empty() {
+        vec![UserMenuBlock::Paragraph {
+            text: UserMenuRichText::Plain(text.to_owned()),
+        }]
+    } else {
+        text.split('\n')
+            .map(|line| UserMenuBlock::Paragraph {
+                text: if bold_line_prefixes
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+                {
+                    UserMenuRichText::Entity(UserMenuRichTextEntity::Bold {
+                        text: Box::new(UserMenuRichText::Plain(line.to_owned())),
+                    })
+                } else {
+                    UserMenuRichText::Plain(line.to_owned())
+                },
+            })
+            .collect()
+    };
     for button in keyboard.inline_keyboard.iter().flatten() {
-        let (callback_data, url) = match &button.kind {
-            InlineKeyboardButtonKind::CallbackData(data) => (Some(data.clone()), None),
-            InlineKeyboardButtonKind::Url(url) => (None, Some(url.to_string())),
+        let (callback_data, url, copy_text) = match &button.kind {
+            InlineKeyboardButtonKind::CallbackData(data) => (Some(data.clone()), None, None),
+            InlineKeyboardButtonKind::Url(url) => (None, Some(url.to_string()), None),
+            InlineKeyboardButtonKind::CopyText(copy_text) => (None, None, Some(copy_text.clone())),
             _ => {
                 return Err(anyhow!(
                     "Unsupported inline keyboard button in user rich message"
@@ -229,6 +257,7 @@ fn text_message_rich_message(
                 },
                 callback_data,
                 url,
+                copy_text,
             }],
         });
     }
@@ -371,6 +400,23 @@ async fn edit_user_message_with_keyboard(
     keyboard: InlineKeyboardMarkup,
 ) -> Result<()> {
     let rich_message = text_message_rich_message(text, &keyboard)?;
+    edit_rich_message(
+        bot,
+        require_callback_message_target(target.into())?,
+        rich_message,
+    )
+    .await
+}
+
+async fn edit_user_message_with_bold_lines(
+    bot: &Bot,
+    target: impl Into<Option<CallbackMessageTarget>>,
+    text: &str,
+    keyboard: InlineKeyboardMarkup,
+    bold_line_prefixes: &[&str],
+) -> Result<()> {
+    let rich_message =
+        text_message_rich_message_with_bold_lines(text, &keyboard, bold_line_prefixes)?;
     edit_rich_message(
         bot,
         require_callback_message_target(target.into())?,
@@ -537,9 +583,15 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
     let bot = Bot::new(token);
-    bot.get_me()
+    let bot_info = bot
+        .get_me()
         .await
         .context("Could not connect to Telegram. Check network, firewall, and proxy settings")?;
+    if let Some(username) = bot_info.username.clone() {
+        state.set_bot_username(username);
+    } else {
+        log::warn!("Telegram did not return a bot username; referral links will be unavailable");
+    }
 
     log::info!("FOXNG Rust bot started");
     Dispatcher::builder(bot, handler)
@@ -555,6 +607,43 @@ async fn main() -> Result<()> {
 fn required_env(name: &str) -> Result<String> {
     let value = env::var(name).with_context(|| format!("Set {name} in the environment or .env"))?;
     Ok(value.trim().to_owned())
+}
+
+fn is_start_command(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|command| command == "/start" || command.starts_with("/start@"))
+}
+
+fn start_referrer_id(text: &str) -> Option<u64> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?;
+    if command != "/start" && !command.starts_with("/start@") {
+        return None;
+    }
+    parts
+        .next()?
+        .strip_prefix("ref_")?
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+fn parse_subscription_checkout_callback(data: &str) -> Option<(i64, Option<&str>, bool)> {
+    if let Some(tariff_id) = data.strip_prefix("user:pc:") {
+        return Some((tariff_id.parse().ok()?, None, false));
+    }
+    if let Some(tariff_id) = data.strip_prefix("user:pw:") {
+        return Some((tariff_id.parse().ok()?, None, true));
+    }
+    let (payload, use_wallet) = if let Some(payload) = data.strip_prefix("user:rc:") {
+        (payload, false)
+    } else {
+        (data.strip_prefix("user:rw:")?, true)
+    };
+    let (tariff_id, username) = payload.split_once(':')?;
+    let tariff_id = tariff_id.parse().ok()?;
+    (!username.is_empty()).then_some((tariff_id, Some(username), use_wallet))
 }
 
 async fn restore_panel_session(state: &AppState) {
@@ -658,9 +747,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
         return Ok(());
     };
 
-    if text == "/start" || text.starts_with("/start ") {
+    if is_start_command(text) {
         if msg.chat.is_private() {
-            if let Err(error) = state.record_bot_user(sender.id.0) {
+            let referrer_id = start_referrer_id(text);
+            if let Err(error) = state.record_bot_user_with_referrer(sender.id.0, referrer_id) {
                 log::error!("Could not record bot user {}: {error}", sender.id);
             }
         }
@@ -811,11 +901,140 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                 }
             }
         }
+        SetupState::WalletUserId => {
+            let user_id = parse_management_number(text).filter(|user_id| *user_id > 0);
+            match user_id {
+                Some(user_id) => match state.wallet_summary(user_id) {
+                    Ok((balance, _)) => {
+                        state.set_setup(sender.id, SetupState::WalletBalance { user_id });
+                        bot.send_message(
+                            msg.chat.id,
+                            format!(
+                                "موجودی فعلی کاربر {}: {}\nموجودی نهایی دلخواه را به تومان وارد کنید. مبلغ منفی هم پذیرفته می‌شود؛ برای لغو /cancel را بزنید.",
+                                persian_digits(user_id),
+                                format_signed_toman(balance)
+                            ),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not read wallet for Telegram user {user_id}: {error}");
+                        state.set_setup(sender.id, SetupState::WalletUserId);
+                        bot.send_message(
+                            msg.chat.id,
+                            "خواندن کیف پول انجام نشد؛ شناسه‌ی عددی کاربر را دوباره بفرستید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                    }
+                },
+                None => {
+                    state.set_setup(sender.id, SetupState::WalletUserId);
+                    bot.send_message(
+                        msg.chat.id,
+                        "شناسه‌ی کاربر باید عددی بزرگ‌تر از صفر باشد؛ دوباره بفرستید یا /cancel را بزنید.",
+                    )
+                    .await?;
+                }
+            }
+        }
+        SetupState::WalletBalance { user_id } => match parse_management_signed_number(text) {
+            Some(target_balance) => match state.set_wallet_balance(user_id, target_balance) {
+                Ok(previous_balance) => {
+                    log::info!(
+                        "Owner {} set wallet balance for user {} from {} to {} toman",
+                        sender.id,
+                        user_id,
+                        previous_balance,
+                        target_balance
+                    );
+                    bot.send_message(
+                        msg.chat.id,
+                        format!(
+                            "✅ موجودی کاربر {} تغییر کرد.\nموجودی قبلی: {}\nموجودی جدید: {}",
+                            persian_digits(user_id),
+                            format_signed_toman(previous_balance),
+                            format_signed_toman(target_balance)
+                        ),
+                    )
+                    .reply_markup(owner_keyboard())
+                    .await?;
+                }
+                Err(error) => {
+                    log::error!("Could not set wallet balance for user {user_id}: {error}");
+                    state.set_setup(sender.id, SetupState::WalletBalance { user_id });
+                    bot.send_message(
+                            msg.chat.id,
+                            "ذخیره‌ی موجودی انجام نشد؛ مبلغ نهایی را دوباره وارد کنید یا /cancel را بزنید.",
+                        )
+                        .await?;
+                }
+            },
+            None => {
+                state.set_setup(sender.id, SetupState::WalletBalance { user_id });
+                bot.send_message(
+                        msg.chat.id,
+                        "مبلغ باید یک عدد صحیح معتبر به تومان باشد؛ عدد منفی هم مجاز است. دوباره بفرستید یا /cancel را بزنید.",
+                    )
+                    .await?;
+            }
+        },
         SetupState::BroadcastAll => {
             broadcast_message(&bot, &msg, &state, false).await?;
         }
         SetupState::BroadcastSubscribers => {
             broadcast_message(&bot, &msg, &state, true).await?;
+        }
+        SetupState::NewTariffVolume => {
+            match parse_management_number(text).and_then(|value| u16::try_from(value).ok()) {
+                Some(volume_gb) if volume_gb > 0 => {
+                    state.set_setup(sender.id, SetupState::NewTariffPrice { volume_gb });
+                    bot.send_message(
+                        msg.chat.id,
+                        "قیمت این تعرفه را به تومان وارد کنید (فقط عدد بزرگ‌تر از صفر).",
+                    )
+                    .await?;
+                }
+                _ => {
+                    state.set_setup(sender.id, SetupState::NewTariffVolume);
+                    bot.send_message(
+                        msg.chat.id,
+                        "حجم باید عددی بزرگ‌تر از صفر باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                    )
+                    .await?;
+                }
+            }
+        }
+        SetupState::NewTariffPrice { volume_gb } => {
+            match parse_management_number(text).and_then(|value| u32::try_from(value).ok()) {
+                Some(price_toman) if price_toman > 0 => {
+                    match state.add_subscription_tariff(volume_gb, price_toman) {
+                        Ok(tariff_id) => {
+                            log::info!(
+                                "Owner {} added subscription tariff {tariff_id} ({volume_gb} GB, {price_toman} toman)",
+                                sender.id
+                            );
+                            send_subscription_tariffs(&bot, sender.id, &state).await?;
+                        }
+                        Err(error) => {
+                            log::error!("Could not add subscription tariff: {error}");
+                            bot.send_message(
+                                msg.chat.id,
+                                "ذخیره تعرفه انجام نشد؛ ممکن است این حجم از قبل ثبت شده باشد. فهرست تعرفه‌ها را بررسی کنید.",
+                            )
+                            .await?;
+                            send_subscription_tariffs(&bot, sender.id, &state).await?;
+                        }
+                    }
+                }
+                _ => {
+                    state.set_setup(sender.id, SetupState::NewTariffPrice { volume_gb });
+                    bot.send_message(
+                        msg.chat.id,
+                        "قیمت باید عددی بزرگ‌تر از صفر و به تومان باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                    )
+                    .await?;
+                }
+            }
         }
         SetupState::PaymentCardNumber => match normalize_card_number(text) {
             Some(card_number) => {
@@ -972,6 +1191,68 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                 }
             }
         }
+        SetupState::TariffVolume { tariff_id } => {
+            match parse_management_number(text).and_then(|value| u16::try_from(value).ok()) {
+                Some(volume_gb) if volume_gb > 0 => {
+                    match state.update_subscription_tariff_volume(tariff_id, volume_gb) {
+                        Ok(true) => send_subscription_tariffs(&bot, sender.id, &state).await?,
+                        Ok(false) => {
+                            bot.send_message(msg.chat.id, "این تعرفه دیگر وجود ندارد.")
+                                .await?;
+                            send_subscription_tariffs(&bot, sender.id, &state).await?;
+                        }
+                        Err(error) => {
+                            log::error!("Could not update subscription tariff volume: {error}");
+                            state.set_setup(sender.id, SetupState::TariffVolume { tariff_id });
+                            bot.send_message(
+                                msg.chat.id,
+                                "ذخیره حجم انجام نشد؛ ممکن است حجم تکراری باشد. مقدار دیگری وارد کنید یا /cancel را بزنید.",
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                _ => {
+                    state.set_setup(sender.id, SetupState::TariffVolume { tariff_id });
+                    bot.send_message(
+                        msg.chat.id,
+                        "حجم باید عددی بزرگ‌تر از صفر باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                    )
+                    .await?;
+                }
+            }
+        }
+        SetupState::TariffPrice { tariff_id } => {
+            match parse_management_number(text).and_then(|value| u32::try_from(value).ok()) {
+                Some(price_toman) if price_toman > 0 => {
+                    match state.update_subscription_tariff_price(tariff_id, price_toman) {
+                        Ok(true) => send_subscription_tariffs(&bot, sender.id, &state).await?,
+                        Ok(false) => {
+                            bot.send_message(msg.chat.id, "این تعرفه دیگر وجود ندارد.")
+                                .await?;
+                            send_subscription_tariffs(&bot, sender.id, &state).await?;
+                        }
+                        Err(error) => {
+                            log::error!("Could not update subscription tariff price: {error}");
+                            state.set_setup(sender.id, SetupState::TariffPrice { tariff_id });
+                            bot.send_message(
+                                msg.chat.id,
+                                "ذخیره قیمت انجام نشد؛ قیمت دیگری وارد کنید یا /cancel را بزنید.",
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                _ => {
+                    state.set_setup(sender.id, SetupState::TariffPrice { tariff_id });
+                    bot.send_message(
+                        msg.chat.id,
+                        "قیمت باید عددی بزرگ‌تر از صفر و به تومان باشد؛ دوباره وارد کنید یا /cancel را بزنید.",
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -1089,9 +1370,15 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
         return Ok(());
     }
 
-    let is_purchase_action =
-        data == "user:buy" || data == "user:plans:month" || data.starts_with("user:plan:");
-    let is_renewal_action = data == "user:renew" || data.starts_with("user:renew:");
+    let is_purchase_action = data == "user:buy"
+        || data == "user:plans:month"
+        || data.starts_with("user:plan:")
+        || data.starts_with("user:pc:")
+        || data.starts_with("user:pw:");
+    let is_renewal_action = data == "user:renew"
+        || data.starts_with("user:renew:")
+        || data.starts_with("user:rc:")
+        || data.starts_with("user:rw:");
     if is_purchase_action || is_renewal_action {
         match state.sales_status() {
             Ok((purchases_enabled, renewals_enabled))
@@ -1172,6 +1459,14 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             )
             .await?;
         }
+        "owner:wallet:manage" if is_owner => {
+            state.set_setup(query.from.id, SetupState::WalletUserId);
+            bot.send_message(
+                query.from.id,
+                "شناسه‌ی عددی تلگرام کاربر را ارسال کنید تا موجودی کیف پول او را تنظیم کنید. برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
         "owner:sales:manage" if is_owner => {
             send_sales_management(&bot, query.from.id, &state).await?;
         }
@@ -1187,6 +1482,125 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
         }
         "owner:sales:renewal:enable" if is_owner => {
             update_sales_feature(&bot, query.from.id, &state, SalesFeature::Renewal, true).await?;
+        }
+        "owner:tariffs:manage" if is_owner => {
+            send_subscription_tariffs(&bot, query.from.id, &state).await?;
+        }
+        "owner:tariffs:add" if is_owner => {
+            state.set_setup(query.from.id, SetupState::NewTariffVolume);
+            bot.send_message(
+                query.from.id,
+                "حجم تعرفه جدید را به گیگابایت وارد کنید (عدد بزرگ‌تر از صفر). برای لغو /cancel را بزنید.",
+            )
+            .await?;
+        }
+        data if data.starts_with("owner:tariffs:item:") && is_owner => {
+            let tariff_id = data
+                .strip_prefix("owner:tariffs:item:")
+                .and_then(|value| value.parse::<i64>().ok());
+            match tariff_id {
+                Some(tariff_id) => match state.subscription_tariff(tariff_id) {
+                    Ok(Some(tariff)) => {
+                        send_text_message_with_keyboard(
+                            &bot,
+                            query.from.id,
+                            subscription_tariff_message(&tariff),
+                            subscription_tariff_detail_keyboard(&tariff),
+                        )
+                        .await?;
+                    }
+                    Ok(None) => {
+                        bot.send_message(query.from.id, "تعرفه پیدا نشد.").await?;
+                        send_subscription_tariffs(&bot, query.from.id, &state).await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not read tariff {tariff_id}: {error}");
+                        bot.send_message(
+                            query.from.id,
+                            "خواندن تعرفه انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                        )
+                        .await?;
+                    }
+                },
+                None => {
+                    bot.send_message(query.from.id, "شناسه تعرفه معتبر نیست.")
+                        .await?;
+                }
+            }
+        }
+        data if data.starts_with("owner:tariffs:toggle:") && is_owner => {
+            let tariff_id = data
+                .strip_prefix("owner:tariffs:toggle:")
+                .and_then(|value| value.parse::<i64>().ok());
+            match tariff_id {
+                Some(tariff_id) => match state.subscription_tariff(tariff_id) {
+                    Ok(Some(tariff)) => {
+                        match state.set_subscription_tariff_enabled(tariff_id, !tariff.enabled) {
+                            Ok(true) => {
+                                send_subscription_tariffs(&bot, query.from.id, &state).await?
+                            }
+                            Ok(false) => {
+                                bot.send_message(query.from.id, "تعرفه پیدا نشد.").await?;
+                            }
+                            Err(error) => {
+                                log::error!("Could not toggle tariff {tariff_id}: {error}");
+                                bot.send_message(
+                                    query.from.id,
+                                    "ذخیره وضعیت تعرفه انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        bot.send_message(query.from.id, "تعرفه پیدا نشد.").await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not read tariff {tariff_id}: {error}");
+                        bot.send_message(
+                            query.from.id,
+                            "خواندن تعرفه انجام نشد؛ لاگ برنامه را بررسی کنید.",
+                        )
+                        .await?;
+                    }
+                },
+                None => {
+                    bot.send_message(query.from.id, "شناسه تعرفه معتبر نیست.")
+                        .await?;
+                }
+            }
+        }
+        data if data.starts_with("owner:tariffs:volume:") && is_owner => {
+            if let Some(tariff_id) = data
+                .strip_prefix("owner:tariffs:volume:")
+                .and_then(|value| value.parse::<i64>().ok())
+            {
+                state.set_setup(query.from.id, SetupState::TariffVolume { tariff_id });
+                bot.send_message(
+                    query.from.id,
+                    "حجم جدید تعرفه را به گیگابایت وارد کنید. برای لغو /cancel را بزنید.",
+                )
+                .await?;
+            } else {
+                bot.send_message(query.from.id, "شناسه تعرفه معتبر نیست.")
+                    .await?;
+            }
+        }
+        data if data.starts_with("owner:tariffs:price:") && is_owner => {
+            if let Some(tariff_id) = data
+                .strip_prefix("owner:tariffs:price:")
+                .and_then(|value| value.parse::<i64>().ok())
+            {
+                state.set_setup(query.from.id, SetupState::TariffPrice { tariff_id });
+                bot.send_message(
+                    query.from.id,
+                    "قیمت جدید تعرفه را به تومان وارد کنید. برای لغو /cancel را بزنید.",
+                )
+                .await?;
+            } else {
+                bot.send_message(query.from.id, "شناسه تعرفه معتبر نیست.")
+                    .await?;
+            }
         }
         "owner:admins:manage" if is_owner => match state.admins() {
             Ok(admins) => {
@@ -1298,25 +1712,90 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             )
             .await?;
         }
-        "user:referral" | "user:wallet" => {
+        "user:referral" => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            let message = if data == "user:referral" {
-                "🎁 قابلیت زیرمجموعه‌گیری به‌زودی فعال می‌شود."
-            } else {
-                "〽️ قابلیت کیف پول به‌زودی فعال می‌شود."
-            };
-            edit_user_message_with_keyboard(&bot, target, message, subscription_back_keyboard())
+            let Some(username) = state.bot_username() else {
+                log::error!("Bot username is unavailable for referral-link generation");
+                edit_user_message_with_keyboard(
+                    &bot,
+                    target,
+                    "ساخت لینک دعوت ممکن نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
                 .await?;
+                return Ok(());
+            };
+            match state.referral_summary(query.from.id.0) {
+                Ok((referrals, commissions)) => {
+                    let link = format!("https://t.me/{username}?start=ref_{}", query.from.id.0);
+                    let body = referral_message(&link, referrals, commissions);
+                    edit_user_message_with_keyboard(&bot, target, &body, referral_keyboard(&link))
+                        .await?;
+                }
+                Err(error) => {
+                    log::error!(
+                        "Could not read referral summary for user {}: {error}",
+                        query.from.id
+                    );
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "خواندن اطلاعات زیرمجموعه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+            }
+        }
+        "user:wallet" => {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+                return Ok(());
+            }
+            match state.wallet_summary(query.from.id.0) {
+                Ok((balance, debt)) => {
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        &wallet_message(balance, debt),
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    log::error!("Could not read wallet for user {}: {error}", query.from.id);
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "خواندن موجودی کیف پول انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+            }
         }
         data if data.starts_with("payment:cancel:") => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            match state.cancel_awaiting_order(query.from.id.0) {
-                Ok(()) => {
+            let order_id = data
+                .strip_prefix("payment:cancel:")
+                .and_then(|value| value.parse::<i64>().ok());
+            match order_id
+                .map(|order_id| state.cancel_payment_order(order_id, query.from.id.0))
+                .transpose()
+            {
+                Ok(Some(true)) => {
                     send_user_menu(&bot, query.from.id, "سفارش در انتظار رسید لغو شد.").await?;
+                }
+                Ok(Some(false)) | Ok(None) => {
+                    send_user_menu(
+                        &bot,
+                        query.from.id,
+                        "به منوی اصلی برگشتید؛ این سفارش دیگر در انتظار رسید نیست.",
+                    )
+                    .await?;
                 }
                 Err(error) => {
                     log::error!(
@@ -1364,17 +1843,16 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             let username = data.strip_prefix("user:renew:select:").unwrap_or_default();
             send_renewal_plans(&bot, target, &query.from, &state, username).await?;
         }
-        data if data.starts_with("user:renew:plan:") => {
+        data if data.starts_with("user:renew:plan:id:") => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            let selection = data.strip_prefix("user:renew:plan:").unwrap_or_default();
-            let (plan_gb, username) = selection
+            let selection = data.strip_prefix("user:renew:plan:id:").unwrap_or_default();
+            let (tariff_id, username) = selection
                 .split_once(':')
-                .and_then(|(gb, username)| gb.parse::<u16>().ok().map(|gb| (gb, username)))
-                .filter(|(gb, _)| monthly_plan_price(*gb).is_some())
+                .and_then(|(id, username)| id.parse::<i64>().ok().map(|id| (id, username)))
                 .unwrap_or((0, ""));
-            if plan_gb == 0 || username.is_empty() {
+            if tariff_id <= 0 || username.is_empty() {
                 edit_user_message_with_keyboard(
                     &bot,
                     target,
@@ -1383,28 +1861,68 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 )
                 .await?;
             } else {
-                process_subscription_selection(
-                    &bot,
-                    target,
-                    &query.from,
-                    plan_gb,
-                    Some(username),
-                    &state,
-                )
-                .await?;
+                match state.subscription_tariff(tariff_id) {
+                    Ok(Some(tariff)) if tariff.enabled => {
+                        process_subscription_selection(
+                            &bot,
+                            target,
+                            &query.from,
+                            &tariff,
+                            Some(username),
+                            &state,
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {
+                        send_renewal_plans(&bot, target, &query.from, &state, username).await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not load subscription tariff {tariff_id}: {error}");
+                        edit_user_message_with_keyboard(
+                            &bot,
+                            target,
+                            "خواندن تعرفه انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                            subscription_back_keyboard(),
+                        )
+                        .await?;
+                    }
+                }
             }
         }
         "user:plans:month" => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            edit_user_message_with_keyboard(
-                &bot,
-                target,
-                "پلن خریدتو انتخاب کن 👇",
-                monthly_plans_keyboard(),
-            )
-            .await?;
+            match state.active_subscription_tariffs() {
+                Ok(tariffs) if tariffs.is_empty() => {
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "در حال حاضر تعرفه فعالی برای خرید وجود ندارد.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+                Ok(tariffs) => {
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "پلن خریدتو انتخاب کن 👇",
+                        monthly_plans_keyboard(&tariffs),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    log::error!("Could not list active subscription tariffs: {error}");
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "خواندن فهرست تعرفه‌ها انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+            }
         }
         "user:main" => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
@@ -1461,6 +1979,60 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
             )
             .await?;
         }
+        data if data.starts_with("user:pc:")
+            || data.starts_with("user:pw:")
+            || data.starts_with("user:rc:")
+            || data.starts_with("user:rw:") =>
+        {
+            if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
+                return Ok(());
+            }
+            let Some((tariff_id, renewal_username, use_wallet)) =
+                parse_subscription_checkout_callback(data)
+            else {
+                edit_user_message_with_keyboard(
+                    &bot,
+                    target,
+                    "اطلاعات سفارش معتبر نیست؛ لطفاً دوباره تعرفه را انتخاب کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            };
+            match state.subscription_tariff(tariff_id) {
+                Ok(Some(tariff)) if tariff.enabled => {
+                    create_subscription_order(
+                        &bot,
+                        target,
+                        &query.from,
+                        &tariff,
+                        renewal_username,
+                        use_wallet,
+                        &state,
+                    )
+                    .await?;
+                }
+                Ok(_) => {
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "این تعرفه دیگر فعال نیست؛ لطفاً تعرفه‌ی دیگری انتخاب کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    log::error!("Could not read tariff {tariff_id} during checkout: {error}");
+                    edit_user_message_with_keyboard(
+                        &bot,
+                        target,
+                        "خواندن تعرفه انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+            }
+        }
         data if data.starts_with("payment:approve:") && (is_owner || is_admin) => {
             if let Some(order_id) = data
                 .strip_prefix("payment:approve:")
@@ -1469,7 +2041,8 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 let source_message = query.regular_message().and_then(|message| {
                     message
                         .caption()
-                        .map(|caption| (message.id, caption.to_owned()))
+                        .or_else(|| message.text())
+                        .map(|text| (message.id, text.to_owned(), message.text().is_some()))
                 });
                 approve_payment_order(&bot, query.from.id, &state, order_id, source_message)
                     .await?;
@@ -1486,7 +2059,8 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                 let source_message = query.regular_message().and_then(|message| {
                     message
                         .caption()
-                        .map(|caption| (message.id, caption.to_owned()))
+                        .or_else(|| message.text())
+                        .map(|text| (message.id, text.to_owned(), message.text().is_some()))
                 });
                 reject_payment_order(&bot, query.from.id, &state, order_id, source_message).await?;
             } else {
@@ -1494,27 +2068,81 @@ async fn handle_callback_query(bot: Bot, query: CallbackQuery, state: Arc<AppSta
                     .await?;
             }
         }
-        data if data.starts_with("user:plan:") => {
+        data if data.starts_with("user:plan:id:") => {
             if !is_owner && !ensure_required_channel_member(&bot, target, query.from.id).await? {
                 return Ok(());
             }
-            let plan_gb = data
-                .strip_prefix("user:plan:")
-                .and_then(|value| value.parse::<u16>().ok());
-            match plan_gb.filter(|gb| monthly_plan_price(*gb).is_some()) {
-                Some(gb) => {
-                    process_subscription_selection(&bot, target, &query.from, gb, None, &state)
+            let tariff_id = data
+                .strip_prefix("user:plan:id:")
+                .and_then(|value| value.parse::<i64>().ok());
+            match tariff_id {
+                Some(tariff_id) => match state.subscription_tariff(tariff_id) {
+                    Ok(Some(tariff)) if tariff.enabled => {
+                        process_subscription_selection(
+                            &bot,
+                            target,
+                            &query.from,
+                            &tariff,
+                            None,
+                            &state,
+                        )
                         .await?
-                }
-                None => {
-                    edit_user_message_with_keyboard(
-                        &bot,
-                        target,
-                        "تعرفه‌ی انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
-                        monthly_plans_keyboard(),
-                    )
-                    .await?;
-                }
+                    }
+                    Ok(_) => {
+                        let tariffs = match state.active_subscription_tariffs() {
+                            Ok(tariffs) => tariffs,
+                            Err(error) => {
+                                log::error!("Could not list active subscription tariffs: {error}");
+                                edit_user_message_with_keyboard(
+                                    &bot,
+                                    target,
+                                    "خواندن تعرفه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                                    subscription_back_keyboard(),
+                                )
+                                .await?;
+                                return Ok(());
+                            }
+                        };
+                        edit_user_message_with_keyboard(
+                            &bot,
+                            target,
+                            "این تعرفه دیگر فعال نیست؛ یکی از تعرفه‌های فعال را انتخاب کنید.",
+                            monthly_plans_keyboard(&tariffs),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not read subscription tariff {tariff_id}: {error}");
+                        edit_user_message_with_keyboard(
+                            &bot,
+                            target,
+                            "خواندن تعرفه انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                            subscription_back_keyboard(),
+                        )
+                        .await?;
+                    }
+                },
+                None => match state.active_subscription_tariffs() {
+                    Ok(tariffs) => {
+                        edit_user_message_with_keyboard(
+                            &bot,
+                            target,
+                            "تعرفه‌ی انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
+                            monthly_plans_keyboard(&tariffs),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        log::error!("Could not list active subscription tariffs: {error}");
+                        edit_user_message_with_keyboard(
+                            &bot,
+                            target,
+                            "خواندن تعرفه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                            subscription_back_keyboard(),
+                        )
+                        .await?;
+                    }
+                },
             }
         }
         "user:join:check" => match is_required_channel_member(&bot, query.from.id).await {
@@ -1727,11 +2355,35 @@ async fn send_renewal_plans(
         .await?;
         return Ok(());
     };
+    let tariffs = match state.active_subscription_tariffs() {
+        Ok(tariffs) => tariffs,
+        Err(error) => {
+            log::error!("Could not list active subscription tariffs: {error}");
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                "خواندن فهرست تعرفه‌ها انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                subscription_back_keyboard(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if tariffs.is_empty() {
+        edit_user_message_with_keyboard(
+            bot,
+            target,
+            "در حال حاضر تعرفه فعالی برای تمدید وجود ندارد.",
+            subscription_back_keyboard(),
+        )
+        .await?;
+        return Ok(());
+    }
     edit_user_message_with_keyboard(
         bot,
         target,
         &format!("بسته‌ی تمدید برای «{}» را انتخاب کنید:", client.username),
-        monthly_renewal_plans_keyboard(&client.username),
+        monthly_renewal_plans_keyboard(&tariffs, &client.username),
     )
     .await?;
     Ok(())
@@ -2013,58 +2665,59 @@ async fn process_subscription_selection(
     bot: &Bot,
     target: Option<CallbackMessageTarget>,
     telegram_user: &User,
-    plan_gb: u16,
+    tariff: &SubscriptionTariff,
     renewal_username: Option<&str>,
     state: &AppState,
 ) -> Result<()> {
-    let target = require_callback_message_target(target)?;
-    let telegram_user_id = telegram_user.id;
-    let Some(price) = monthly_plan_price(plan_gb) else {
-        edit_user_message_with_keyboard(
-            bot,
-            target,
-            "تعرفه‌ی انتخاب‌شده معتبر نیست؛ دوباره از منو انتخاب کنید.",
-            subscription_back_keyboard(),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    let payment_details = match state.payment_details() {
-        Ok(Some(details)) => Some(details),
-        Ok(None) => {
-            let card_number = env::var("PAYMENT_CARD_NUMBER")
-                .ok()
-                .and_then(|value| normalize_card_number(value.trim()));
-            let cardholder_name = env::var("PAYMENT_CARDHOLDER_NAME")
-                .ok()
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
-            card_number.zip(cardholder_name)
-        }
+    let (wallet_balance, _) = match state.wallet_summary(telegram_user.id.0) {
+        Ok(summary) => summary,
         Err(error) => {
-            log::error!("Could not read payment card details: {error}");
+            log::error!(
+                "Could not read wallet for user {} before checkout: {error}",
+                telegram_user.id
+            );
             edit_user_message_with_keyboard(
                 bot,
                 target,
-                "خواندن اطلاعات پرداخت ممکن نشد؛ لطفاً بعداً دوباره تلاش کنید.",
+                "خواندن موجودی کیف پول ممکن نشد؛ لطفاً دوباره تلاش کنید.",
                 subscription_back_keyboard(),
             )
             .await?;
             return Ok(());
         }
     };
-    let Some((card_number, cardholder_name)) = payment_details else {
-        log::error!("Payment card configuration is missing");
-        edit_user_message_with_keyboard(
-            bot,
-            target,
-            "پرداخت در حال حاضر تنظیم نشده است. لطفاً بعداً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
-            subscription_back_keyboard(),
-        )
-        .await?;
-        return Ok(());
+    let subscription_kind = if renewal_username.is_some() {
+        "♻️ تمدید اشتراک"
+    } else {
+        "🆕 خرید اشتراک جدید"
     };
+    let message = format!(
+        "🧾 جزئیات اشتراک\n{subscription_kind}\n📦 بسته: {} گیگابایت | ⏳ ۳۰ روز\n💰 مبلغ اشتراک: {}\n👛 موجودی دقیق کیف پول: {}\n\nℹ️ اگر موجودی کیف پول کمتر از مبلغ اشتراک است، با دکمه‌ی «پرداخت با کیف پول» مبلغ نهایی فاکتور را کاهش دهید.",
+        persian_digits(tariff.volume_gb),
+        format_toman(tariff.price_toman),
+        format_signed_toman(wallet_balance)
+    );
+    edit_user_message_with_bold_lines(
+        bot,
+        target,
+        &message,
+        subscription_payment_options_keyboard(tariff.id, renewal_username),
+        &["💰 مبلغ اشتراک:"],
+    )
+    .await
+}
+
+async fn create_subscription_order(
+    bot: &Bot,
+    target: Option<CallbackMessageTarget>,
+    telegram_user: &User,
+    tariff: &SubscriptionTariff,
+    renewal_username: Option<&str>,
+    use_wallet: bool,
+    state: &AppState,
+) -> Result<()> {
+    let target = require_callback_message_target(target)?;
+    let telegram_user_id = telegram_user.id;
 
     let (base_url, access_token) = match panel_api_context(state) {
         Ok(Some(context)) => context,
@@ -2192,16 +2845,49 @@ async fn process_subscription_selection(
         .chain(telegram_user.last_name.as_deref())
         .collect::<Vec<_>>()
         .join(" ");
-    let order_id = match state.create_payment_order(NewPaymentOrder {
+    let order_snapshot = match state.create_tariff_payment_order(NewTariffPaymentOrder {
         telegram_user_id: telegram_user_id.0,
         account_name: &account_name,
         telegram_username: telegram_user.username.as_deref(),
         panel_username: &panel_username,
-        plan_gb,
-        price_toman: price,
+        tariff_id: tariff.id,
+        use_wallet,
         is_renewal,
     }) {
-        Ok(order_id) => order_id,
+        Ok(Some(order)) => order,
+        Ok(None) => {
+            match state.active_subscription_tariffs() {
+                Ok(tariffs) if !tariffs.is_empty() => {
+                    edit_user_message_with_keyboard(
+                        bot,
+                        target,
+                        "این تعرفه در همین لحظه غیرفعال شده است؛ لطفاً یکی از تعرفه‌های فعال را انتخاب کنید.",
+                        monthly_plans_keyboard(&tariffs),
+                    )
+                    .await?;
+                }
+                Ok(_) => {
+                    edit_user_message_with_keyboard(
+                        bot,
+                        target,
+                        "در حال حاضر تعرفه فعالی وجود ندارد.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    log::error!("Could not list active subscription tariffs: {error}");
+                    edit_user_message_with_keyboard(
+                        bot,
+                        target,
+                        "خواندن تعرفه‌ها انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                        subscription_back_keyboard(),
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
         Err(error) => {
             log::error!(
                 "Could not create payment order for Telegram user {}: {error}",
@@ -2217,14 +2903,134 @@ async fn process_subscription_selection(
             return Ok(());
         }
     };
+    let order_id = order_snapshot.id;
+    let plan_gb = order_snapshot.plan_gb;
+    let price_toman = order_snapshot.price_toman;
+    let wallet_used_toman = order_snapshot.wallet_used_toman;
+    let amount_due_toman = order_snapshot.amount_due_toman;
+    let wallet_balance_after = order_snapshot.wallet_balance_after;
+    if use_wallet && wallet_used_toman == 0 {
+        state.cancel_payment_order(order_id, telegram_user_id.0)?;
+        edit_user_message_with_keyboard(
+            bot,
+            target,
+            "⚠️ موجودی قابل استفاده‌ای در کیف پول ندارید. برای ادامه، گزینه‌ی «کارت‌به‌کارت» را انتخاب کنید.",
+            subscription_payment_options_keyboard(tariff.id, renewal_username),
+        )
+        .await?;
+        return Ok(());
+    }
 
+    if amount_due_toman == 0 {
+        let order = match state.payment_order(order_id) {
+            Ok(Some(order)) => order,
+            Ok(None) => {
+                log::error!("Wallet payment order {order_id} disappeared after creation");
+                state.cancel_payment_order(order_id, telegram_user_id.0)?;
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن سفارش کیف پول ممکن نشد؛ لطفاً دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not read wallet payment order {order_id}: {error}");
+                state.cancel_payment_order(order_id, telegram_user_id.0)?;
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن سفارش کیف پول انجام نشد؛ لطفاً دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if !send_wallet_order_for_review(bot, state, &order).await? {
+            state.cancel_payment_order(order_id, telegram_user_id.0)?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                "❌ درخواست برای مالک یا ادمین‌ها ارسال نشد و موجودی شما کسر نشد. لطفاً بعداً دوباره تلاش کنید.",
+                subscription_back_keyboard(),
+            )
+            .await?;
+            return Ok(());
+        }
+        edit_user_message_with_bold_lines(
+            bot,
+            target,
+            &format!(
+                "✅ درخواست خرید با کیف پول ثبت شد.\n📦 بسته: {} گیگابایت\n💰 مبلغ اصلی اشتراک: {}\n👛 مبلغ استفاده‌شده: {}\n💳 مبلغ نهایی پرداخت: {}\n💵 مانده‌ی کیف پول پس از تأیید: {}\n\n⏳ مبلغ استفاده‌شده پس از تأیید کسر می‌شود و اشتراک فعال خواهد شد.",
+                persian_digits(plan_gb),
+                format_toman(price_toman),
+                format_toman(wallet_used_toman),
+                format_toman(amount_due_toman),
+                format_signed_toman(wallet_balance_after)
+            ),
+            subscription_back_keyboard(),
+            &["💳 مبلغ نهایی پرداخت:"],
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let payment_details = match state.payment_details() {
+        Ok(Some(details)) => Some(details),
+        Ok(None) => {
+            let card_number = env::var("PAYMENT_CARD_NUMBER")
+                .ok()
+                .and_then(|value| normalize_card_number(value.trim()));
+            let cardholder_name = env::var("PAYMENT_CARDHOLDER_NAME")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            card_number.zip(cardholder_name)
+        }
+        Err(error) => {
+            log::error!("Could not read payment card details: {error}");
+            state.cancel_payment_order(order_id, telegram_user_id.0)?;
+            edit_user_message_with_keyboard(
+                bot,
+                target,
+                "خواندن اطلاعات کارت انجام نشد و رزرو کیف پول لغو شد؛ لطفاً بعداً دوباره تلاش کنید.",
+                subscription_back_keyboard(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let Some((card_number, cardholder_name)) = payment_details else {
+        log::error!("Payment card configuration is missing");
+        state.cancel_payment_order(order_id, telegram_user_id.0)?;
+        edit_user_message_with_keyboard(
+            bot,
+            target,
+            "اطلاعات کارت پرداخت تنظیم نشده است و رزرو کیف پول لغو شد. لطفاً با پشتیبانی تماس بگیرید.",
+            subscription_back_keyboard(),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let kind = if is_renewal {
+        "♻️ تمدید اشتراک"
+    } else {
+        "🆕 خرید جدید"
+    };
     edit_text_message(
         bot,
         target,
         format!(
-            "🧾 جزئیات سفارش\n📦 بسته: {} گیگابایت\n⏳ مدت: ۳۰ روز\n💰 مبلغ: {}\n\n💳 شماره کارت:\n(برای کپی، کافی است یک‌بار روی شماره کارت ضربه بزنید)\n\n<blockquote><code>{}</code></blockquote>\n👤 به نام: {}\n\nپس از پرداخت، عکس رسید تراکنش را همین‌جا ارسال کنید.⚠️\n فقط عکس رسید پذیرفته می‌شود.\nاگر به عکس رسید دسترسی ندارید، با آیدی پشتیبانی\n 🆔: @ipublicsupport\n در ارتباط باشید.",
+            "🧾 جزئیات سفارش\n{kind}\n📦 بسته: {} گیگابایت | ⏳ مدت: ۳۰ روز\n💰 مبلغ اصلی اشتراک: {}\n👛 کسر از کیف پول: {}\n<b>💳 مبلغ نهایی قابل پرداخت: {}</b>\n👛 موجودی پس از تأیید پرداخت: {}\n\n💳 شماره کارت:\n(برای کپی، یک‌بار روی شماره کارت ضربه بزنید)\n\n<blockquote><code>{}</code></blockquote>\n👤 به نام: {}\n\n🧾 پس از واریز مبلغ نهایی، عکس رسید را همین‌جا ارسال کنید.\n⚠️ فقط عکس رسید پذیرفته می‌شود.\n🆘 پشتیبانی: @ipublicsupport",
             persian_digits(plan_gb),
-            format_toman(price),
+            format_toman(price_toman),
+            format_toman(wallet_used_toman),
+            format_toman(amount_due_toman),
+            format_signed_toman(wallet_balance_after),
             html_escape(&card_number),
             html_escape(&cardholder_name)
         ),
@@ -2234,6 +3040,56 @@ async fn process_subscription_selection(
     .await?;
 
     Ok(())
+}
+
+async fn send_wallet_order_for_review(
+    bot: &Bot,
+    state: &AppState,
+    order: &PaymentOrder,
+) -> Result<bool> {
+    let caption = payment_review_caption(order);
+    let mut reviewers = vec![state.owner_id.0];
+    match state.admins() {
+        Ok(admins) => reviewers.extend(admins),
+        Err(error) => log::error!(
+            "Could not load reviewers for wallet order {}: {error}",
+            order.id
+        ),
+    }
+    reviewers.sort_unstable();
+    reviewers.dedup();
+
+    let mut delivered = 0usize;
+    for reviewer_id in reviewers {
+        match bot
+            .send_message(UserId(reviewer_id), caption.clone())
+            .parse_mode(ParseMode::Html)
+            .reply_markup(payment_review_keyboard(order.id))
+            .await
+        {
+            Ok(message) => {
+                delivered += 1;
+                if let Err(error) = state.record_payment_review_message(
+                    order.id,
+                    reviewer_id,
+                    message.id.0,
+                    &caption,
+                    true,
+                ) {
+                    log::error!(
+                        "Could not track wallet review message {} for order {} and reviewer {reviewer_id}: {error}",
+                        message.id.0,
+                        order.id
+                    );
+                }
+            }
+            Err(error) => log::warn!(
+                "Could not deliver wallet order {} to reviewer {reviewer_id}: {error}",
+                order.id
+            ),
+        }
+    }
+    Ok(delivered > 0)
 }
 
 async fn receive_payment_receipt(
@@ -2324,6 +3180,7 @@ async fn receive_payment_receipt(
                 InputFile::file_id(FileId(file_id.clone())),
             )
             .caption(caption.clone())
+            .parse_mode(ParseMode::Html)
             .reply_markup(payment_review_keyboard(order_id))
             .await
         {
@@ -2334,6 +3191,7 @@ async fn receive_payment_receipt(
                     reviewer_id,
                     message.id.0,
                     &caption,
+                    false,
                 ) {
                     log::error!(
                         "Could not track review message {} for order {order_id} and reviewer {reviewer_id}: {error}",
@@ -2409,6 +3267,7 @@ fn receipt_confirmation_rich_message() -> UserMenuRichMessage {
                     style: UserMenuButtonStyle::Danger,
                     callback_data: Some("user:menu".to_owned()),
                     url: None,
+                    copy_text: None,
                 }],
             },
         ],
@@ -2421,7 +3280,7 @@ async fn approve_payment_order(
     reviewer_id: UserId,
     state: &AppState,
     order_id: i64,
-    source_message: Option<(MessageId, String)>,
+    source_message: Option<(MessageId, String, bool)>,
 ) -> ResponseResult<()> {
     let order = match state.claim_payment_order(order_id) {
         Ok(Some(order)) => order,
@@ -2538,10 +3397,10 @@ async fn approve_payment_order(
                 "اشتراک شما فعال شد"
             };
             let caption = format!(
-                "✅ {action}\n👤 نام کاربری: {}\n📦 حجم: {} گیگ\n💰 مبلغ: {}\n📅 انقضا: {}\n\n🔗 لینک کانفیگ (برای کپی، یک‌بار روی لینک ضربه بزنید):\n\n<code>{}</code>",
+                "✅ {action}\n👤 نام کاربری: {}\n📦 حجم: {} گیگ{}\n📅 انقضا: {}\n\n🔗 لینک کانفیگ (برای کپی، یک‌بار روی لینک ضربه بزنید):\n\n<code>{}</code>",
                 html_escape(&subscription.username),
                 persian_digits(order.plan_gb),
-                format_toman(order.price_toman),
+                payment_amount_details_html(&order),
                 persian_datetime(
                     subscription
                         .expires_at
@@ -2608,7 +3467,7 @@ async fn reject_payment_order(
     reviewer_id: UserId,
     state: &AppState,
     order_id: i64,
-    source_message: Option<(MessageId, String)>,
+    source_message: Option<(MessageId, String, bool)>,
 ) -> ResponseResult<()> {
     match state.reject_payment_order(order_id) {
         Ok(Some(telegram_user_id)) => {
@@ -2624,7 +3483,7 @@ async fn reject_payment_order(
             if let Err(error) = bot
                 .send_message(
                     UserId(telegram_user_id),
-                    "❌ رسید پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @ipublicsupport در ارتباط باشید.",
+                    "❌ درخواست پرداخت شما تأیید نشد و اشتراکی فعال نشد. برای پیگیری با پشتیبانی @ipublicsupport در ارتباط باشید.",
                 )
                 .await
             {
@@ -2679,14 +3538,26 @@ async fn edit_payment_review_message(
     reviewer_id: u64,
     message_id: MessageId,
     caption: &str,
+    is_text: bool,
     status: PaymentReviewStatus,
 ) {
-    if let Err(error) = bot
-        .edit_message_caption(UserId(reviewer_id), message_id)
-        .caption(final_payment_review_caption(caption, status))
+    let result = if is_text {
+        bot.edit_message_text(
+            UserId(reviewer_id),
+            message_id,
+            final_payment_review_caption(caption, status),
+        )
+        .parse_mode(ParseMode::Html)
         .reply_markup(InlineKeyboardMarkup::default())
         .await
-    {
+    } else {
+        bot.edit_message_caption(UserId(reviewer_id), message_id)
+            .caption(final_payment_review_caption(caption, status))
+            .parse_mode(ParseMode::Html)
+            .reply_markup(InlineKeyboardMarkup::default())
+            .await
+    };
+    if let Err(error) = result {
         log::warn!(
             "Could not update review message {} for order {order_id} and reviewer {reviewer_id}: {error}",
             message_id.0
@@ -2700,7 +3571,7 @@ async fn finalize_payment_review_messages(
     order_id: i64,
     status: PaymentReviewStatus,
     reviewer_id: UserId,
-    source_message: Option<&(MessageId, String)>,
+    source_message: Option<&(MessageId, String, bool)>,
 ) {
     let messages = match state.payment_review_messages(order_id) {
         Ok(messages) => messages,
@@ -2709,7 +3580,7 @@ async fn finalize_payment_review_messages(
             Vec::new()
         }
     };
-    let source_message_id = source_message.map(|(message_id, _)| message_id.0);
+    let source_message_id = source_message.map(|(message_id, _, _)| message_id.0);
     let source_is_tracked = messages.iter().any(|message| {
         message.reviewer_user_id == reviewer_id.0 && Some(message.message_id) == source_message_id
     });
@@ -2721,15 +3592,24 @@ async fn finalize_payment_review_messages(
             message.reviewer_user_id,
             MessageId(message.message_id),
             &message.caption,
+            message.is_text,
             status,
         )
         .await;
     }
 
     if !source_is_tracked {
-        if let Some((message_id, caption)) = source_message {
-            edit_payment_review_message(bot, order_id, reviewer_id.0, *message_id, caption, status)
-                .await;
+        if let Some((message_id, caption, is_text)) = source_message {
+            edit_payment_review_message(
+                bot,
+                order_id,
+                reviewer_id.0,
+                *message_id,
+                caption,
+                *is_text,
+                status,
+            )
+            .await;
         }
     }
 }
@@ -2740,7 +3620,7 @@ fn payment_review_keyboard(order_id: i64) -> InlineKeyboardMarkup {
             "✅ تأیید و فعال‌سازی",
             format!("payment:approve:{order_id}"),
         ),
-        InlineKeyboardButton::callback("❌ رد رسید", format!("payment:reject:{order_id}")),
+        InlineKeyboardButton::callback("❌ رد سفارش", format!("payment:reject:{order_id}")),
     ]])
 }
 
@@ -2762,24 +3642,52 @@ fn payment_review_caption(order: &PaymentOrder) -> String {
         .as_ref()
         .map(|username| format!("@{username}"))
         .unwrap_or_else(|| "ندارد".to_owned());
-    let receipt_status = if order.receipt_file_id.is_some() {
+    let receipt_status = if order.amount_due_toman == 0 && order.is_wallet_payment {
+        "نیازی نیست؛ پرداخت کامل با کیف پول"
+    } else if order.receipt_file_id.is_some() {
         "دریافت شد ✅"
     } else {
         "دریافت نشده"
     };
 
+    let payment_details = payment_amount_details_html(order);
+    let full_wallet_alert = if order.is_wallet_payment
+        && order.amount_due_toman == 0
+        && order.wallet_used_toman == order.price_toman
+    {
+        "\n‼️‼️‼️‼️‼️ این اشتراک به‌طور کامل با کیف پول پرداخت شده است؛ لطفاً درخواست را بررسی و تأیید یا رد کنید."
+    } else {
+        ""
+    };
+
     format!(
-        "🧾 سفارش #{} ({order_kind}) — ⏳ در انتظار بررسی\n👤 کاربر: {} ({})\n🔗 یوزرنیم: {}\n📧 ایمیل کانفیگ: {}\n📦 پلن: {} گیگ | ⏳ ۳۰ روزه | 💰 {}\n🧾 رسید: {}\n🕓 {}\nوضعیت: ⏳ منتظر تأیید",
+        "🧾 سفارش #{} ({order_kind}) — ⏳ در انتظار بررسی\n👤 کاربر: {} ({})\n🔗 یوزرنیم: {}\n📧 ایمیل کانفیگ: {}\n📦 پلن: {} گیگ | ⏳ ۳۰ روزه{payment_details}{full_wallet_alert}\n🧾 رسید: {}\n🕓 {}\nوضعیت: ⏳ منتظر تأیید",
         persian_digits(order.id),
-        order.account_name,
+        html_escape(&order.account_name),
         persian_digits(order.telegram_user_id),
-        telegram_username,
-        order.panel_username,
+        html_escape(&telegram_username),
+        html_escape(&order.panel_username),
         persian_digits(order.plan_gb),
-        format_toman(order.price_toman),
         receipt_status,
         persian_datetime(chrono::Utc::now().with_timezone(&chrono_tz::Asia::Tehran))
     )
+}
+
+fn payment_amount_details_html(order: &PaymentOrder) -> String {
+    if order.wallet_used_toman > 0 {
+        format!(
+            "\n💰 مبلغ اصلی اشتراک: {}\n👛 کسر از کیف پول: {}\n<b>💳 مبلغ نهایی پرداخت: {}</b>",
+            format_toman(order.price_toman),
+            format_toman(order.wallet_used_toman),
+            format_toman(order.amount_due_toman)
+        )
+    } else {
+        format!(
+            "\n💰 مبلغ اصلی اشتراک: {}\n<b>💳 مبلغ نهایی پرداخت: {}</b>",
+            format_toman(order.price_toman),
+            format_toman(order.amount_due_toman)
+        )
+    }
 }
 
 fn persian_datetime(datetime: chrono::DateTime<chrono_tz::Tz>) -> String {
@@ -2888,6 +3796,14 @@ fn owner_keyboard() -> InlineKeyboardMarkup {
             "🛒 وضعیت خرید و تمدید",
             "owner:sales:manage",
         )],
+        vec![InlineKeyboardButton::callback(
+            "📦 مدیریت تعرفه‌ها",
+            "owner:tariffs:manage",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "〽️ مدیریت کیف پول کاربران",
+            "owner:wallet:manage",
+        )],
     ];
     InlineKeyboardMarkup::new(rows)
 }
@@ -2947,6 +3863,110 @@ async fn send_sales_management(
         }
     }
     Ok(())
+}
+
+async fn send_subscription_tariffs(
+    bot: &Bot,
+    owner_id: UserId,
+    state: &AppState,
+) -> ResponseResult<()> {
+    match state.subscription_tariffs() {
+        Ok(tariffs) => {
+            let body = if tariffs.is_empty() {
+                "هنوز تعرفه‌ای ثبت نشده است.".to_owned()
+            } else {
+                format!(
+                    "📦 تعرفه‌های اشتراک\n\nبرای ویرایش حجم، قیمت یا وضعیت، تعرفه موردنظر را انتخاب کنید.\n\n{}",
+                    tariffs
+                        .iter()
+                        .map(subscription_tariff_message)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            send_text_message_with_keyboard(
+                bot,
+                owner_id,
+                body,
+                subscription_tariffs_keyboard(&tariffs),
+            )
+            .await?;
+        }
+        Err(error) => {
+            log::error!("Could not list subscription tariffs: {error}");
+            bot.send_message(
+                owner_id,
+                "خواندن تعرفه‌ها انجام نشد؛ لاگ برنامه را بررسی کنید.",
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn subscription_tariff_message(tariff: &SubscriptionTariff) -> String {
+    format!(
+        "{} {} گیگ | {} | {}",
+        if tariff.enabled { "✅" } else { "⛔" },
+        persian_digits(tariff.volume_gb),
+        format_toman(tariff.price_toman),
+        if tariff.enabled {
+            "فعال"
+        } else {
+            "غیرفعال"
+        }
+    )
+}
+
+fn subscription_tariffs_keyboard(tariffs: &[SubscriptionTariff]) -> InlineKeyboardMarkup {
+    let mut rows = tariffs
+        .iter()
+        .map(|tariff| {
+            vec![InlineKeyboardButton::callback(
+                format!(
+                    "{} {} گیگ | {}",
+                    if tariff.enabled { "✅" } else { "⛔" },
+                    persian_digits(tariff.volume_gb),
+                    format_toman(tariff.price_toman)
+                ),
+                format!("owner:tariffs:item:{}", tariff.id),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "➕ افزودن تعرفه",
+        "owner:tariffs:add",
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "🔙 بازگشت",
+        "owner:main",
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn subscription_tariff_detail_keyboard(tariff: &SubscriptionTariff) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "✏️ تغییر حجم",
+            format!("owner:tariffs:volume:{}", tariff.id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "💰 تغییر قیمت",
+            format!("owner:tariffs:price:{}", tariff.id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            if tariff.enabled {
+                "⛔ غیرفعال‌کردن تعرفه"
+            } else {
+                "✅ فعال‌کردن تعرفه"
+            },
+            format!("owner:tariffs:toggle:{}", tariff.id),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "🔙 بازگشت به تعرفه‌ها",
+            "owner:tariffs:manage",
+        )],
+    ])
 }
 
 async fn update_sales_feature(
@@ -3067,6 +4087,26 @@ fn user_keyboard() -> InlineKeyboardMarkup {
             "user:support",
         )],
     ])
+}
+
+fn referral_keyboard(link: &str) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::copy_text_button(
+            "📋 کپی لینک دعوت",
+            CopyTextButton {
+                text: link.to_owned(),
+            },
+        )],
+        vec![InlineKeyboardButton::callback("🔙 بازگشت", "user:main")],
+    ])
+}
+
+fn referral_message(link: &str, referrals: u64, commissions: i64) -> String {
+    format!(
+        "🎁 پورسانت فعلی: ۱۵٪\n👥 اگر دوستتان با لینک دعوت شما ربات را Start کند، از مبلغ هر خرید یا تمدید موفق او، ۱۵٪ به کیف پول شما اضافه می‌شود.\n\n🔗 لینک دعوت اختصاصی شما:\n{link}\n\n👥 تعداد زیرمجموعه‌ها: {}\n💰 مجموع پورسانت ثبت‌شده: {}",
+        persian_digits(referrals),
+        format_signed_toman(commissions)
+    )
 }
 
 fn purchase_menu_keyboard() -> InlineKeyboardMarkup {
@@ -3206,80 +4246,80 @@ fn subscription_period_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-fn monthly_plans_keyboard() -> InlineKeyboardMarkup {
-    monthly_plan_keyboard(|gb| format!("user:plan:{gb}"), "user:buy", true)
-}
-
-fn monthly_renewal_plans_keyboard(username: &str) -> InlineKeyboardMarkup {
+fn monthly_plans_keyboard(tariffs: &[SubscriptionTariff]) -> InlineKeyboardMarkup {
     monthly_plan_keyboard(
-        |gb| format!("user:renew:plan:{gb}:{username}"),
-        "user:renew",
-        true,
+        tariffs,
+        |tariff| format!("user:plan:id:{}", tariff.id),
+        "user:buy",
     )
 }
 
-fn monthly_plan_keyboard(
-    callback_for_plan: impl Fn(u16) -> String,
-    back_callback: &str,
-    combine_quota_and_price: bool,
+fn monthly_renewal_plans_keyboard(
+    tariffs: &[SubscriptionTariff],
+    username: &str,
 ) -> InlineKeyboardMarkup {
-    let mut rows = if combine_quota_and_price {
-        MONTHLY_PLAN_GB
-            .chunks(2)
-            .map(|plans| {
-                plans
-                    .iter()
-                    .map(|gb| {
-                        let price =
-                            monthly_plan_price(*gb).expect("configured monthly plan has a price");
-                        InlineKeyboardButton::callback(
-                            format!("📦 {} گیگ | 💰 {}", persian_digits(gb), format_toman(price)),
-                            callback_for_plan(*gb),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+    monthly_plan_keyboard(
+        tariffs,
+        |tariff| format!("user:renew:plan:id:{}:{username}", tariff.id),
+        "user:renew",
+    )
+}
+
+fn subscription_payment_options_keyboard(
+    tariff_id: i64,
+    renewal_username: Option<&str>,
+) -> InlineKeyboardMarkup {
+    let (card_callback, wallet_callback) = if let Some(username) = renewal_username {
+        (
+            format!("user:rc:{tariff_id}:{username}"),
+            format!("user:rw:{tariff_id}:{username}"),
+        )
     } else {
-        MONTHLY_PLAN_GB
-            .iter()
-            .map(|gb| {
-                let price = monthly_plan_price(*gb).expect("configured monthly plan has a price");
-                let callback = callback_for_plan(*gb);
-                vec![
-                    InlineKeyboardButton::callback(
-                        format!("💰 {}", format_toman(price)),
-                        callback.clone(),
-                    ),
-                    InlineKeyboardButton::callback(
-                        format!("📦 {} گیگ", persian_digits(gb)),
-                        callback,
-                    ),
-                ]
-            })
-            .collect::<Vec<_>>()
+        (
+            format!("user:pc:{tariff_id}"),
+            format!("user:pw:{tariff_id}"),
+        )
     };
+    InlineKeyboardMarkup::new(vec![
+        vec![
+            InlineKeyboardButton::callback("💳 کارت‌به‌کارت", card_callback),
+            InlineKeyboardButton::callback("👛 پرداخت با کیف پول", wallet_callback),
+        ],
+        vec![InlineKeyboardButton::callback(
+            "🏠 بازگشت به منوی اصلی",
+            "user:main",
+        )],
+    ])
+}
+
+fn monthly_plan_keyboard(
+    tariffs: &[SubscriptionTariff],
+    callback_for_plan: impl Fn(&SubscriptionTariff) -> String,
+    back_callback: &str,
+) -> InlineKeyboardMarkup {
+    let mut rows = tariffs
+        .chunks(2)
+        .map(|plans| {
+            plans
+                .iter()
+                .map(|tariff| {
+                    InlineKeyboardButton::callback(
+                        format!(
+                            "📦 {} گیگ | 💰 {}",
+                            persian_digits(tariff.volume_gb),
+                            format_toman(tariff.price_toman)
+                        ),
+                        callback_for_plan(tariff),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     rows.push(vec![InlineKeyboardButton::callback(
         "🔙 بازگشت",
         back_callback,
     )]);
     InlineKeyboardMarkup::new(rows)
-}
-
-fn monthly_plan_price(gb: u16) -> Option<u32> {
-    match gb {
-        10 => Some(60_000),
-        20 => Some(115_000),
-        30 => Some(165_000),
-        50 => Some(255_000),
-        80 => Some(370_000),
-        100 => Some(450_000),
-        150 => Some(675_000),
-        200 => Some(850_000),
-        250 => Some(1_025_000),
-        300 => Some(1_200_000),
-        _ => None,
-    }
 }
 
 fn persian_digits(value: impl ToString) -> String {
@@ -3359,6 +4399,97 @@ fn format_toman(amount: u32) -> String {
     format!("{} تومان", persian_digits(grouped))
 }
 
+fn format_signed_toman(amount: i64) -> String {
+    let reversed_digits = amount
+        .unsigned_abs()
+        .to_string()
+        .chars()
+        .rev()
+        .collect::<Vec<_>>();
+    let mut grouped_reversed = String::new();
+    for (index, digit) in reversed_digits.iter().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped_reversed.push('٬');
+        }
+        grouped_reversed.push(*digit);
+    }
+
+    let grouped = grouped_reversed.chars().rev().collect::<String>();
+    format!(
+        "{}{} تومان",
+        if amount < 0 { "−" } else { "" },
+        persian_digits(grouped)
+    )
+}
+
+fn wallet_message(balance: i64, debt: i64) -> String {
+    let mut paragraphs = vec![format!(
+        "〽️ موجودی کیف پول شما: {}",
+        format_signed_toman(balance)
+    )];
+    if debt > 0 {
+        paragraphs.push(format!("⚠️ بدهی کمیسیون: {}", format_signed_toman(debt)));
+    }
+    paragraphs.push(
+        "🚫 این کیف پول فعلاً قابل شارژ نیست و فقط مبالغ حاصل از زیرمجموعه‌گیری به آن اضافه می‌شود."
+            .to_owned(),
+    );
+    paragraphs.push(
+        "🛍️ هر وقت بخواهید، می‌توانید هنگام خرید یا تمدید اشتراک از موجودی کیف پول استفاده کنید.".to_owned(),
+    );
+    paragraphs.join("\n\n")
+}
+
+fn parse_management_number(value: &str) -> Option<u64> {
+    let mut digits = String::new();
+    for character in value.chars() {
+        match character {
+            '0'..='9' => digits.push(character),
+            '۰' => digits.push('0'),
+            '۱' => digits.push('1'),
+            '۲' => digits.push('2'),
+            '۳' => digits.push('3'),
+            '۴' => digits.push('4'),
+            '۵' => digits.push('5'),
+            '۶' => digits.push('6'),
+            '۷' => digits.push('7'),
+            '۸' => digits.push('8'),
+            '۹' => digits.push('9'),
+            '٠' => digits.push('0'),
+            '١' => digits.push('1'),
+            '٢' => digits.push('2'),
+            '٣' => digits.push('3'),
+            '٤' => digits.push('4'),
+            '٥' => digits.push('5'),
+            '٦' => digits.push('6'),
+            '٧' => digits.push('7'),
+            '٨' => digits.push('8'),
+            '٩' => digits.push('9'),
+            ',' | '٬' | ' ' | '\t' => {}
+            _ => return None,
+        }
+    }
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn parse_management_signed_number(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let (negative, digits) =
+        if let Some(value) = value.strip_prefix('-').or_else(|| value.strip_prefix('−')) {
+            (true, value)
+        } else if let Some(value) = value.strip_prefix('+') {
+            (false, value)
+        } else {
+            (false, value)
+        };
+    let magnitude = i64::try_from(parse_management_number(digits)?).ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
 fn join_channel_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::url(
@@ -3388,70 +4519,87 @@ mod tests {
     use teloxide::types::InlineKeyboardButtonKind;
 
     #[test]
-    fn monthly_plan_prices_follow_the_requested_tiers() {
-        assert_eq!(
-            MONTHLY_PLAN_GB,
-            [10, 20, 30, 50, 80, 100, 150, 200, 250, 300]
-        );
-        let prices = MONTHLY_PLAN_GB
-            .iter()
-            .map(|gb| monthly_plan_price(*gb).unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            prices,
-            vec![
-                60_000, 115_000, 165_000, 255_000, 370_000, 450_000, 675_000, 850_000, 1_025_000,
-                1_200_000
-            ]
-        );
-        assert_eq!(monthly_plan_price(101), None);
-    }
-
-    #[test]
     fn formats_prices_with_persian_digits_and_separators() {
         assert_eq!(format_toman(600_000), "۶۰۰٬۰۰۰ تومان");
     }
 
     #[test]
-    fn monthly_tariff_buttons_use_two_columns_and_have_emojis() {
-        let rows = monthly_plans_keyboard().inline_keyboard;
+    fn parses_admin_tariff_values_in_persian_digits() {
+        assert_eq!(parse_management_number("۱٬۰۲۵٬۰۰۰"), Some(1_025_000));
+        assert_eq!(parse_management_number("300"), Some(300));
+        assert_eq!(parse_management_number("۰"), Some(0));
+        assert_eq!(parse_management_number("-10"), None);
+        assert_eq!(parse_management_number("10 گیگ"), None);
+    }
 
-        assert_eq!(rows.len(), MONTHLY_PLAN_GB.chunks(2).len() + 1);
+    #[test]
+    fn monthly_tariff_buttons_use_two_columns_and_have_emojis() {
+        let tariffs = test_tariffs();
+        let rows = monthly_plans_keyboard(&tariffs).inline_keyboard;
+
+        assert_eq!(rows.len(), tariffs.chunks(2).len() + 1);
         assert!(rows[..rows.len() - 1].iter().all(|row| {
-            row.len() == 2 && row.iter().all(|button| button.text.starts_with("📦"))
+            (1..=2).contains(&row.len()) && row.iter().all(|button| button.text.starts_with("📦"))
         }));
         assert!(rows[..rows.len() - 1]
             .iter()
             .flatten()
-            .zip(MONTHLY_PLAN_GB.iter())
-            .all(|(button, gb)| {
-                button.text.contains(&format!("{} گیگ", persian_digits(gb)))
-                    && button
-                        .text
-                        .contains(&format_toman(monthly_plan_price(*gb).unwrap()))
+            .zip(tariffs.iter())
+            .all(|(button, tariff)| {
+                button
+                    .text
+                    .contains(&format!("{} گیگ", persian_digits(tariff.volume_gb)))
+                    && button.text.contains(&format_toman(tariff.price_toman))
             }));
         assert!(rows.last().unwrap()[0].text.starts_with("🔙"));
+        assert!(matches!(
+            &rows[0][0].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:plan:id:7"
+        ));
     }
 
     #[test]
     fn renewal_plan_buttons_match_purchase_plan_format() {
-        let rows = monthly_renewal_plans_keyboard("haku-123456").inline_keyboard;
+        let tariffs = test_tariffs();
+        let rows = monthly_renewal_plans_keyboard(&tariffs, "haku-123456").inline_keyboard;
 
-        assert_eq!(rows.len(), MONTHLY_PLAN_GB.chunks(2).len() + 1);
+        assert_eq!(rows.len(), tariffs.chunks(2).len() + 1);
         assert!(rows[..rows.len() - 1].iter().all(|row| {
-            row.len() == 2 && row.iter().all(|button| button.text.starts_with("📦"))
+            (1..=2).contains(&row.len()) && row.iter().all(|button| button.text.starts_with("📦"))
         }));
         assert!(rows[..rows.len() - 1]
             .iter()
             .flatten()
-            .zip(MONTHLY_PLAN_GB.iter())
-            .all(|(button, gb)| {
-                button.text.contains(&format!("{} گیگ", persian_digits(gb)))
-                    && button
-                        .text
-                        .contains(&format_toman(monthly_plan_price(*gb).unwrap()))
+            .zip(tariffs.iter())
+            .all(|(button, tariff)| {
+                button
+                    .text
+                    .contains(&format!("{} گیگ", persian_digits(tariff.volume_gb)))
+                    && button.text.contains(&format_toman(tariff.price_toman))
             }));
+    }
+
+    fn test_tariffs() -> Vec<SubscriptionTariff> {
+        vec![
+            SubscriptionTariff {
+                id: 7,
+                volume_gb: 10,
+                price_toman: 60_000,
+                enabled: true,
+            },
+            SubscriptionTariff {
+                id: 8,
+                volume_gb: 20,
+                price_toman: 115_000,
+                enabled: true,
+            },
+            SubscriptionTariff {
+                id: 9,
+                volume_gb: 25,
+                price_toman: 140_000,
+                enabled: true,
+            },
+        ]
     }
 
     #[test]
@@ -3614,6 +4762,32 @@ mod tests {
     }
 
     #[test]
+    fn subscription_checkout_offers_card_and_wallet_for_new_and_renewal_orders() {
+        let purchase = subscription_payment_options_keyboard(7, None).inline_keyboard;
+        assert!(matches!(
+            &purchase[0][0].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:pc:7"
+        ));
+        assert!(matches!(
+            &purchase[0][1].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:pw:7"
+        ));
+        let renewal = subscription_payment_options_keyboard(7, Some("haku-123456")).inline_keyboard;
+        assert!(matches!(
+            &renewal[0][0].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:rc:7:haku-123456"
+        ));
+        assert!(matches!(
+            &renewal[0][1].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:rw:7:haku-123456"
+        ));
+        assert_eq!(
+            parse_subscription_checkout_callback("user:rw:7:haku-123456"),
+            Some((7, Some("haku-123456"), true))
+        );
+    }
+
+    #[test]
     fn owner_back_buttons_are_red_in_rich_text_keyboards() {
         let rich_message = text_message_rich_message("مدیریت پنل", &panel_keyboard()).unwrap();
 
@@ -3685,6 +4859,79 @@ mod tests {
     }
 
     #[test]
+    fn wallet_review_caption_shows_partial_breakdown_and_full_wallet_alert() {
+        let mut order = PaymentOrder {
+            id: 8,
+            telegram_user_id: 42,
+            account_name: "Test User".into(),
+            telegram_username: Some("test".into()),
+            panel_username: "haku-420001".into(),
+            plan_gb: 10,
+            price_toman: 100_000,
+            wallet_used_toman: 30_000,
+            amount_due_toman: 70_000,
+            is_wallet_payment: true,
+            is_renewal: false,
+            receipt_file_id: Some("receipt".into()),
+        };
+        let partial = payment_review_caption(&order);
+        assert!(partial.contains("💰 مبلغ اصلی اشتراک: ۱۰۰٬۰۰۰ تومان"));
+        assert!(partial.contains("👛 کسر از کیف پول: ۳۰٬۰۰۰ تومان"));
+        assert!(partial.contains("<b>💳 مبلغ نهایی پرداخت: ۷۰٬۰۰۰ تومان</b>"));
+        assert!(!partial.contains("‼️‼️‼️‼️‼️"));
+
+        order.wallet_used_toman = 100_000;
+        order.amount_due_toman = 0;
+        order.receipt_file_id = None;
+        let fully_paid = payment_review_caption(&order);
+        assert!(fully_paid.contains("‼️‼️‼️‼️‼️"));
+        assert!(fully_paid.contains("پرداخت کامل با کیف پول"));
+        assert!(fully_paid.contains("لطفاً درخواست را بررسی و تأیید یا رد کنید"));
+    }
+
+    #[test]
+    fn final_payment_amount_is_bold_in_user_and_reviewer_messages() {
+        let order = PaymentOrder {
+            id: 8,
+            telegram_user_id: 42,
+            account_name: "Test User".into(),
+            telegram_username: None,
+            panel_username: "haku-420001".into(),
+            plan_gb: 10,
+            price_toman: 60_000,
+            wallet_used_toman: 0,
+            amount_due_toman: 60_000,
+            is_wallet_payment: false,
+            is_renewal: false,
+            receipt_file_id: Some("receipt".into()),
+        };
+        assert!(payment_amount_details_html(&order)
+            .contains("<b>💳 مبلغ نهایی پرداخت: ۶۰٬۰۰۰ تومان</b>"));
+
+        let rich_message = text_message_rich_message_with_bold_lines(
+            "جزئیات سفارش\n💳 مبلغ نهایی پرداخت: ۶۰٬۰۰۰ تومان",
+            &subscription_back_keyboard(),
+            &["💳 مبلغ نهایی پرداخت:"],
+        )
+        .unwrap();
+        assert!(matches!(
+            &rich_message.blocks[1],
+            UserMenuBlock::Paragraph {
+                text: UserMenuRichText::Entity(UserMenuRichTextEntity::Bold { text })
+            } if matches!(
+                text.as_ref(),
+                UserMenuRichText::Plain(line)
+                    if line == "💳 مبلغ نهایی پرداخت: ۶۰٬۰۰۰ تومان"
+            )
+        ));
+        assert!(matches!(
+            rich_message.blocks.last(),
+            Some(UserMenuBlock::Buttons { buttons })
+                if buttons[0].style == UserMenuButtonStyle::Danger
+        ));
+    }
+
+    #[test]
     fn client_selection_lists_status_and_separates_usage_from_renewal() {
         let clients = vec![
             panel::PanelClient {
@@ -3718,9 +4965,10 @@ mod tests {
                 if data == "user:link:select:haku-123456"
         ));
         assert!(matches!(
-            &monthly_renewal_plans_keyboard("haku-123456").inline_keyboard[0][0].kind,
+            &monthly_renewal_plans_keyboard(&test_tariffs(), "haku-123456").inline_keyboard[0][0]
+                .kind,
             InlineKeyboardButtonKind::CallbackData(data)
-                if data == "user:renew:plan:10:haku-123456"
+                if data == "user:renew:plan:id:7:haku-123456"
         ));
     }
 
@@ -3782,6 +5030,80 @@ mod tests {
             &button.kind,
             InlineKeyboardButtonKind::CallbackData(data) if data == "owner:sales:manage"
         )));
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:wallet:manage"
+        )));
+    }
+
+    #[test]
+    fn start_referral_parameter_is_parsed_only_from_start_commands() {
+        assert!(is_start_command("/start ref_123"));
+        assert!(is_start_command("/start@foxngbot ref_123"));
+        assert!(!is_start_command("/starting ref_123"));
+        assert_eq!(start_referrer_id("/start ref_123"), Some(123));
+        assert_eq!(start_referrer_id("/start@foxngbot ref_123"), Some(123));
+        assert_eq!(start_referrer_id("/start ref_0"), None);
+        assert_eq!(start_referrer_id("/start ref_invalid"), None);
+        assert_eq!(start_referrer_id("/help ref_123"), None);
+    }
+
+    #[test]
+    fn referral_keyboard_contains_the_invite_link_and_home_button() {
+        let link = "https://t.me/foxngbot?start=ref_123";
+        let keyboard = referral_keyboard(link);
+        let rows = &keyboard.inline_keyboard;
+        assert!(matches!(
+            &rows[0][0].kind,
+            InlineKeyboardButtonKind::CopyText(button) if button.text == link
+        ));
+        assert_eq!(rows[0][0].text, "📋 کپی لینک دعوت");
+        assert!(matches!(
+            &rows[1][0].kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "user:main"
+        ));
+
+        let rich_message = text_message_rich_message("لینک دعوت", &keyboard).unwrap();
+        let payload = serde_json::to_value(rich_message).unwrap();
+        assert_eq!(
+            payload["blocks"][1]["buttons"][0]["copy_text"]["text"],
+            link
+        );
+        assert_eq!(payload["blocks"][2]["buttons"][0]["style"], "danger");
+    }
+
+    #[test]
+    fn referral_message_explains_the_commission_rate_and_qualifying_orders() {
+        let message = referral_message("https://t.me/foxngbot?start=ref_123", 2, 15_000);
+
+        assert!(message.contains("پورسانت فعلی: ۱۵٪"));
+        assert!(message.contains("ربات را Start کند"));
+        assert!(message.contains("هر خرید یا تمدید موفق او، ۱۵٪"));
+        assert!(message.contains("به کیف پول شما اضافه می‌شود"));
+        assert!(message.contains("https://t.me/foxngbot?start=ref_123"));
+        assert!(message.contains("مجموع پورسانت ثبت‌شده: ۱۵٬۰۰۰ تومان"));
+    }
+
+    #[test]
+    fn parses_and_formats_signed_wallet_amounts() {
+        assert_eq!(parse_management_signed_number("-۱۲٬۵۰۰"), Some(-12_500));
+        assert_eq!(parse_management_signed_number("−250"), Some(-250));
+        assert_eq!(parse_management_signed_number("+900"), Some(900));
+        assert_eq!(parse_management_signed_number("۹۰۰"), Some(900));
+        assert_eq!(parse_management_signed_number("--1"), None);
+        assert_eq!(parse_management_signed_number(""), None);
+        assert_eq!(format_signed_toman(-12_500), "−۱۲٬۵۰۰ تومان");
+    }
+
+    #[test]
+    fn wallet_message_shows_exact_balance_and_usage_notice() {
+        let message = wallet_message(12_500, 0);
+
+        assert!(message.contains("موجودی دقیق کیف پول شما: ۱۲٬۵۰۰ تومان"));
+        assert!(message.contains("فعلاً قابل شارژ نیست"));
+        assert!(message.contains("فقط مبالغ حاصل از زیرمجموعه‌گیری"));
+        assert!(message.contains("هنگام خرید اشتراک از موجودی کیف پول استفاده کنید"));
+        assert!(!message.contains("بدهی کمیسیون"));
     }
 
     #[test]
@@ -3871,6 +5193,34 @@ mod tests {
         assert!(owner_menu.iter().flatten().any(|button| matches!(
             &button.kind,
             InlineKeyboardButtonKind::CallbackData(data) if data == "owner:broadcast:subscribers"
+        )));
+    }
+
+    #[test]
+    fn owner_can_manage_tariffs_from_the_main_menu() {
+        let owner_menu = owner_keyboard().inline_keyboard;
+        assert!(owner_menu.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data) if data == "owner:tariffs:manage"
+        )));
+
+        let tariff = test_tariffs().remove(0);
+        let detail = subscription_tariff_detail_keyboard(&tariff).inline_keyboard;
+        assert_eq!(detail.len(), 4);
+        assert!(detail.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data)
+                if data == &format!("owner:tariffs:volume:{}", tariff.id)
+        )));
+        assert!(detail.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data)
+                if data == &format!("owner:tariffs:price:{}", tariff.id)
+        )));
+        assert!(detail.iter().flatten().any(|button| matches!(
+            &button.kind,
+            InlineKeyboardButtonKind::CallbackData(data)
+                if data == &format!("owner:tariffs:toggle:{}", tariff.id)
         )));
     }
 
