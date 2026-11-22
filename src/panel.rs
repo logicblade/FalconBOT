@@ -286,13 +286,23 @@ pub async fn provision_subscription(
         )
         .await
     } else {
+        let username = if is_valid_panel_username(preferred_username) {
+            preferred_username.to_owned()
+        } else {
+            log::warn!(
+                "Stored username for Telegram user {telegram_user_id} is incompatible with the panel; selecting a valid available username"
+            );
+            suggest_available_panel_username(base_url, access_token, telegram_user_id, &[])
+                .await?
+                .ok_or(PanelError::UsernameCollision)?
+        };
         create_user(
             &client,
             base_url,
             access_token,
             &note,
             seller_group_id,
-            preferred_username,
+            &username,
             data_limit_bytes,
         )
         .await
@@ -745,9 +755,21 @@ fn suggest_unused_username(telegram_user_id: u64, used_usernames: &[String]) -> 
     let start = rand::random_range(0..1000);
     (0..1000).find_map(|offset| {
         let suffix = (start + offset) % 1000;
-        let username = format!("Falcon🦅-{prefix}{suffix:03}");
+        let username = format!("Falcon-{prefix}{suffix:03}");
         (!used_usernames.contains(&username)).then_some(username)
     })
+}
+
+fn is_valid_panel_username(username: &str) -> bool {
+    let length = username.chars().count();
+    (3..=128).contains(&length)
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'@' | b'.'))
+        && !username.as_bytes().windows(2).any(|pair| {
+            matches!(pair[0], b'-' | b'_' | b'@' | b'.')
+                && matches!(pair[1], b'-' | b'_' | b'@' | b'.')
+        })
 }
 
 fn parse_expiration(value: &PanelExpiration) -> Option<DateTime<Utc>> {
@@ -913,22 +935,45 @@ mod tests {
     }
 
     #[test]
-    fn generated_username_contains_id_prefix_and_six_digits() {
+    fn generated_username_matches_panel_rules_and_contains_id_prefix() {
         let username = suggest_unused_username(123_456_789, &[]).unwrap();
-        let suffix = username.strip_prefix("Falcon🦅-").unwrap();
+        let suffix = username.strip_prefix("Falcon-").unwrap();
 
-        assert!(username.starts_with("Falcon🦅-123"));
+        assert!(is_valid_panel_username(&username));
+        assert!(username.starts_with("Falcon-123"));
         assert_eq!(suffix.len(), 6);
         assert!(suffix.chars().all(|digit| digit.is_ascii_digit()));
     }
 
     #[test]
+    fn rejects_legacy_generated_username_with_emoji() {
+        assert!(!is_valid_panel_username("Falcon🦅-123456"));
+    }
+
+    #[test]
+    fn create_user_payload_assigns_the_selected_seller_group() {
+        let payload = CreateUserRequest {
+            username: "Falcon-123456",
+            status: "active",
+            data_limit: 1,
+            expire: "2026-12-22T13:01:00+03:30".into(),
+            data_limit_reset_strategy: "no_reset",
+            note: "123456789".into(),
+            group_ids: [42],
+        };
+
+        let payload = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(payload["group_ids"], serde_json::json!([42]));
+    }
+
+    #[test]
     fn new_username_avoids_existing_client_names() {
-        let used = vec!["Falcon🦅-123000".to_owned(), "Falcon🦅-123001".to_owned()];
+        let used = vec!["Falcon-123000".to_owned(), "Falcon-123001".to_owned()];
 
         let username = suggest_unused_username(123_456_789, &used).unwrap();
 
-        assert!(username.starts_with("Falcon🦅-123"));
+        assert!(username.starts_with("Falcon-123"));
         assert!(!used.contains(&username));
     }
 
