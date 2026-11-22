@@ -7,11 +7,11 @@ readonly INSTALL_PATH="/usr/local/bin/falconbot"
 readonly UPDATE_PATH="/usr/local/sbin/falconbot-update"
 readonly CONFIG_DIR="/etc/falconbot"
 readonly ENV_FILE="${CONFIG_DIR}/falconbot.env"
-readonly REPOSITORY_FILE="${CONFIG_DIR}/repository"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly DATA_DIR="/var/lib/falconbot"
 readonly LOG_DIR="/var/log/falconbot"
 readonly BINARY_ASSET="falconbot-linux-x86_64"
+readonly RELEASE_URL="https://github.com/logicblade/FalconBOT/releases/latest/download"
 
 fail() {
     printf 'Error: %s\n' "$*" >&2
@@ -22,13 +22,9 @@ if [[ "${EUID}" -ne 0 ]]; then
     fail "Run this installer as root (for example, with sudo)."
 fi
 
-if [[ $# -gt 1 ]]; then
-    fail "Usage: FALCONBOT_REPO=OWNER/REPOSITORY $0 [OWNER/REPOSITORY]"
+if [[ $# -ne 0 ]]; then
+    fail "Usage: $0"
 fi
-
-REPOSITORY="${1:-${FALCONBOT_REPO:-}}"
-[[ "${REPOSITORY}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
-    || fail "Set FALCONBOT_REPO to the public GitHub repository (OWNER/REPOSITORY)."
 
 for command_name in curl sha256sum awk install systemctl useradd getent; do
     command -v "${command_name}" >/dev/null 2>&1 \
@@ -44,11 +40,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-release_url="https://github.com/${REPOSITORY}/releases/latest/download"
 download_asset() {
     local asset_name="$1"
     curl --fail --location --silent --show-error --retry 3 \
-        "${release_url}/${asset_name}" \
+        "${RELEASE_URL}/${asset_name}" \
         --output "${temporary_dir}/${asset_name}"
 }
 
@@ -101,12 +96,6 @@ if [[ ! -f "${ENV_FILE}" ]]; then
 fi
 chown root:root "${ENV_FILE}"
 chmod 0600 "${ENV_FILE}"
-
-repository_tmp="$(mktemp "${CONFIG_DIR}/.repository.XXXXXX")"
-printf '%s\n' "${REPOSITORY}" > "${repository_tmp}"
-chown root:root "${repository_tmp}"
-chmod 0640 "${repository_tmp}"
-mv -f -- "${repository_tmp}" "${REPOSITORY_FILE}"
 
 install -o root -g root -m 0755 "${temporary_dir}/${BINARY_ASSET}" \
     "${INSTALL_PATH}.new"
