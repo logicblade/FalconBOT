@@ -326,6 +326,17 @@ pub async fn panel_clients_for_telegram_user(
     Ok(clients)
 }
 
+pub async fn check_connection(base_url: &Url, access_token: &str) -> Result<(), PanelError> {
+    let response = api_client()?
+        .get(api_url(base_url, "/api/groups/simple")?)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|_| PanelError::Request)?;
+    ensure_success(response)?;
+    Ok(())
+}
+
 pub async fn suggest_available_panel_username(
     base_url: &Url,
     access_token: &str,

@@ -115,6 +115,18 @@ pub struct BotUserDetails {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferralCommissionCredit {
+    pub referrer_user_id: u64,
+    pub amount_toman: i64,
+    pub balance_after_toman: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaymentCompletion {
+    pub referral_credit: Option<ReferralCommissionCredit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinancialStatistics {
     pub total_sales_toman: i64,
     pub total_commissions_toman: i64,
@@ -1753,9 +1765,10 @@ impl AppState {
         order_id: i64,
         telegram_user_id: u64,
         panel_username: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> rusqlite::Result<PaymentCompletion> {
         let mut database = self.database.lock().expect("database lock poisoned");
         let transaction = database.transaction()?;
+        let mut referral_credit = None;
         let order = transaction
             .query_row(
                 "SELECT telegram_user_id, price_toman, wallet_used_toman FROM payment_orders
@@ -1869,6 +1882,13 @@ impl AppState {
                         params![order_id, referrer_id, telegram_user_id, commission],
                     )?;
                     if inserted == 1 {
+                        let referrer_user_id = referrer_id.parse::<u64>().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
                         let previous_balance = transaction
                             .query_row(
                                 "SELECT balance_toman FROM wallets WHERE telegram_user_id = ?1",
@@ -1904,12 +1924,17 @@ impl AppState {
                          VALUES (?1, ?2, ?3, 'referral_commission', ?4)",
                             params![referrer_id, commission, new_balance, order_id],
                         )?;
+                        referral_credit = Some(ReferralCommissionCredit {
+                            referrer_user_id,
+                            amount_toman: commission,
+                            balance_after_toman: new_balance,
+                        });
                     }
                 }
             }
         }
         transaction.commit()?;
-        Ok(())
+        Ok(PaymentCompletion { referral_credit })
     }
 
     pub fn cancel_awaiting_order(&self, telegram_user_id: u64) -> rusqlite::Result<()> {
@@ -2827,9 +2852,19 @@ mod tests {
         state.submit_order_receipt(order_id, 20, "receipt").unwrap();
         state.claim_payment_order(order_id).unwrap().unwrap();
 
-        state
+        let referral_credit = state
             .complete_payment_order(order_id, 20, "haku-200001")
+            .unwrap()
+            .referral_credit
             .unwrap();
+        assert_eq!(
+            referral_credit,
+            ReferralCommissionCredit {
+                referrer_user_id: 10,
+                amount_toman: 17_000,
+                balance_after_toman: 17_000,
+            }
+        );
         assert!(state
             .complete_payment_order(order_id, 20, "haku-200001")
             .is_err());
@@ -2968,9 +3003,10 @@ mod tests {
             .unwrap();
         state.submit_order_receipt(order_id, 30, "receipt").unwrap();
         state.claim_payment_order(order_id).unwrap().unwrap();
-        state
+        let completion = state
             .complete_payment_order(order_id, 30, "haku-300001")
             .unwrap();
+        assert_eq!(completion.referral_credit, None);
 
         assert_eq!(state.referral_status().unwrap(), (false, 15));
         assert_eq!(state.referral_summary(10).unwrap(), (1, 0));

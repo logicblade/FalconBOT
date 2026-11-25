@@ -38,8 +38,46 @@ use zeroize::Zeroizing;
 
 const USER_MENU_PROMPT: &str = "از منوی زیر انتخاب کن 👇🏻";
 const MAX_DATABASE_BACKUP_SIZE: u64 = 20 * 1024 * 1024;
+const PANEL_RECONNECT_ATTEMPTS: usize = 3;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+macro_rules! retry_panel_request {
+    ($state:expr, $base_url:ident, $access_token:ident, $operation:expr, $request:expr) => {{
+        let mut result = ($request).await;
+        for attempt in 1..=PANEL_RECONNECT_ATTEMPTS {
+            let should_reconnect = result
+                .as_ref()
+                .err()
+                .is_some_and(should_reconnect_after_panel_error);
+            if !should_reconnect {
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+            match connect_panel_once($state).await {
+                Ok((connected_url, token)) => {
+                    $base_url = connected_url;
+                    $access_token = token;
+                    result = ($request).await;
+                    if result.is_ok() {
+                        log::info!("Panel connection recovered during {}", $operation);
+                        break;
+                    }
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Panel reconnection attempt {attempt}/{PANEL_RECONNECT_ATTEMPTS} failed during {}: {error}",
+                        $operation
+                    );
+                    if !is_transient_panel_error(&error) {
+                        break;
+                    }
+                }
+            }
+        }
+        result
+    }};
+}
 fn start_user_menu_prompt(first_name: &str) -> String {
     let name = first_name.split_whitespace().collect::<Vec<_>>().join(" ");
     let name = if name.is_empty() { "دوست" } else { &name };
@@ -585,13 +623,13 @@ async fn main() -> Result<()> {
         Err(error) => return Err(anyhow!("Could not read BOT_DB_PATH: {error}")),
     };
     let state = Arc::new(AppState::new(UserId(owner_id), &database_path)?);
-    restore_panel_session(&state).await;
+    let bot = Bot::new(token);
+    restore_panel_session(&bot, &state).await;
 
     let handler = dptree::entry()
         .branch(Update::filter_message().endpoint(handle_message))
         .branch(Update::filter_callback_query().endpoint(handle_callback_query));
 
-    let bot = Bot::new(token);
     let bot_info = bot
         .get_me()
         .await
@@ -786,43 +824,138 @@ fn parse_subscription_checkout_callback(data: &str) -> Option<(i64, Option<&str>
     (!username.is_empty()).then_some((tariff_id, Some(username), use_wallet))
 }
 
-async fn restore_panel_session(state: &AppState) {
+async fn notify_panel_issue(bot: &Bot, state: &AppState, details: &str) {
+    let message = format!(
+        "⚠️ هشدار پنل\nربات نتوانست از پنل استفاده کند.\n\nعلت: {details}\n\nلطفاً وضعیت پنل، اتصال شبکه و اطلاعات ورود را بررسی کنید."
+    );
+    let mut recipients = vec![state.owner_id.0];
+    match state.admins() {
+        Ok(admins) => recipients.extend(admins),
+        Err(error) => log::error!("Could not load admins for panel warning: {error}"),
+    }
+    recipients.sort_unstable();
+    recipients.dedup();
+    for recipient in recipients {
+        if let Err(error) = bot.send_message(UserId(recipient), message.clone()).await {
+            log::error!("Could not send panel warning to user {recipient}: {error}");
+        }
+    }
+}
+
+fn is_transient_panel_error(error: &panel::PanelError) -> bool {
+    matches!(
+        error,
+        panel::PanelError::Request
+            | panel::PanelError::InvalidResponse
+            | panel::PanelError::HttpStatus(408 | 425 | 429 | 500..=599)
+    )
+}
+
+fn should_reconnect_after_panel_error(error: &panel::PanelError) -> bool {
+    matches!(
+        error,
+        panel::PanelError::Unauthorized
+            | panel::PanelError::HttpStatus(401)
+            | panel::PanelError::Request
+            | panel::PanelError::InvalidResponse
+            | panel::PanelError::HttpStatus(408 | 425 | 429 | 500..=599)
+    )
+}
+
+async fn connect_panel_once(
+    state: &AppState,
+) -> std::result::Result<(Url, Zeroizing<String>), panel::PanelError> {
+    let panel_config = state.panel_config().map_err(|error| {
+        log::error!("Could not read panel configuration while reconnecting: {error}");
+        panel::PanelError::Request
+    })?;
+    let Some((saved_url, username)) = panel_config else {
+        return Err(panel::PanelError::Request);
+    };
+    let password = state.panel_password().map_err(|error| {
+        log::error!("Could not load panel password while reconnecting: {error}");
+        panel::PanelError::Request
+    })?;
+    let Some(password) = password else {
+        return Err(panel::PanelError::Unauthorized);
+    };
+    let base_url = panel::normalize_panel_url(&saved_url)?;
+    let access_token = panel::authenticate(&base_url, &username, &password).await?;
+    state.set_session(Zeroizing::new(access_token.to_string()));
+    Ok((base_url, access_token))
+}
+
+async fn connect_panel_with_retries(
+    state: &AppState,
+    operation: &str,
+) -> std::result::Result<(Url, Zeroizing<String>), panel::PanelError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match connect_panel_once(state).await {
+            Ok(context) => return Ok(context),
+            Err(error) => {
+                log::warn!(
+                    "Panel connection attempt {attempt}/{PANEL_RECONNECT_ATTEMPTS} failed during {operation}: {error}"
+                );
+                if attempt >= PANEL_RECONNECT_ATTEMPTS || !is_transient_panel_error(&error) {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+            }
+        }
+    }
+}
+
+async fn authenticate_panel_with_retries(
+    base_url: &Url,
+    username: &str,
+    password: &str,
+    operation: &str,
+) -> std::result::Result<Zeroizing<String>, panel::PanelError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match panel::authenticate(base_url, username, password).await {
+            Ok(access_token) => return Ok(access_token),
+            Err(error) => {
+                log::warn!(
+                    "Panel authentication attempt {attempt}/{PANEL_RECONNECT_ATTEMPTS} failed during {operation}: {error}"
+                );
+                if attempt >= PANEL_RECONNECT_ATTEMPTS || !is_transient_panel_error(&error) {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+            }
+        }
+    }
+}
+
+async fn restore_panel_session(bot: &Bot, state: &AppState) {
     let panel_config = match state.panel_config() {
         Ok(config) => config,
         Err(error) => {
             log::error!("Could not read panel configuration during startup: {error}");
+            notify_panel_issue(
+                bot,
+                state,
+                &format!("خواندن تنظیمات پنل هنگام راه‌اندازی ناموفق بود: {error}"),
+            )
+            .await;
             return;
         }
     };
-    let Some((saved_url, username)) = panel_config else {
+    if panel_config.is_none() {
         return;
-    };
-    let password = match state.panel_password() {
-        Ok(Some(password)) => password,
-        Ok(None) => {
-            log::info!("No panel password is stored in the operating-system credential store");
-            return;
-        }
-        Err(error) => {
-            log::error!("Could not load panel credentials from the operating-system credential store: {error}");
-            return;
-        }
-    };
-    let base_url = match panel::normalize_panel_url(&saved_url) {
-        Ok(url) => url,
-        Err(error) => {
-            log::error!("Saved panel URL is invalid: {error}");
-            return;
-        }
-    };
+    }
 
-    match panel::authenticate(&base_url, &username, &password).await {
-        Ok(access_token) => {
-            state.set_session(access_token);
+    match connect_panel_with_retries(state, "startup").await {
+        Ok(_) => {
             log::info!("Panel session restored automatically");
         }
         Err(error) => {
             log::warn!("Could not restore the panel session automatically: {error}");
+            notify_panel_issue(bot, state, &error.user_message()).await;
         }
     }
 }
@@ -1617,7 +1750,9 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
 
             bot.send_message(msg.chat.id, "در حال بررسی اطلاعات ورود پنل…")
                 .await?;
-            let authentication = panel::authenticate(&base_url, &username, &password).await;
+            let authentication =
+                authenticate_panel_with_retries(&base_url, &username, &password, "owner login")
+                    .await;
 
             match authentication {
                 Ok(access_token) => {
@@ -1655,6 +1790,7 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                         sender.id,
                         error
                     );
+                    notify_panel_issue(&bot, &state, &error.user_message()).await;
                     bot.send_message(msg.chat.id, error.user_message())
                         .reply_markup(owner_keyboard())
                         .await?;
@@ -2920,18 +3056,72 @@ enum ClientListPurpose {
     Link,
 }
 
-fn panel_api_context(state: &AppState) -> Result<Option<(Url, Zeroizing<String>)>> {
-    let Some((saved_url, _)) = state
-        .panel_config()
-        .context("Could not read panel configuration")?
-    else {
+async fn panel_api_context(
+    bot: &Bot,
+    state: &AppState,
+    operation: &str,
+) -> Result<Option<(Url, Zeroizing<String>)>> {
+    let panel_config = match state.panel_config() {
+        Ok(config) => config,
+        Err(error) => {
+            notify_panel_issue(
+                bot,
+                state,
+                &format!("{operation}: خواندن تنظیمات پنل ناموفق بود: {error}"),
+            )
+            .await;
+            return Err(error).context("Could not read panel configuration");
+        }
+    };
+    let Some((saved_url, _)) = panel_config else {
+        notify_panel_issue(
+            bot,
+            state,
+            &format!("{operation}: تنظیمات پنل ثبت نشده است."),
+        )
+        .await;
         return Ok(None);
     };
-    let base_url = panel::normalize_panel_url(&saved_url).map_err(anyhow::Error::new)?;
-    let Some(access_token) = state.panel_access_token() else {
-        return Ok(None);
+    let base_url = match panel::normalize_panel_url(&saved_url) {
+        Ok(url) => url,
+        Err(error) => {
+            notify_panel_issue(bot, state, &format!("{operation}: {error}")).await;
+            return Err(anyhow::Error::new(error));
+        }
     };
-    Ok(Some((base_url, access_token)))
+    let (mut base_url, mut access_token) = match state.panel_access_token() {
+        Some(access_token) => (base_url, access_token),
+        None => match connect_panel_with_retries(state, operation).await {
+            Ok(context) => context,
+            Err(error) => {
+                notify_panel_issue(
+                    bot,
+                    state,
+                    &format!("{operation}: {}", error.user_message()),
+                )
+                .await;
+                return Ok(None);
+            }
+        },
+    };
+    match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        operation,
+        panel::check_connection(&base_url, access_token.as_str())
+    ) {
+        Ok(()) => Ok(Some((base_url, access_token))),
+        Err(error) => {
+            notify_panel_issue(
+                bot,
+                state,
+                &format!("{operation}: {}", error.user_message()),
+            )
+            .await;
+            Ok(None)
+        }
+    }
 }
 
 async fn send_panel_client_choices(
@@ -2941,43 +3131,49 @@ async fn send_panel_client_choices(
     state: &AppState,
     purpose: ClientListPurpose,
 ) -> Result<()> {
-    let (base_url, access_token) = match panel_api_context(state) {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not prepare panel connection for client listing: {error:#}");
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let clients = match panel::panel_clients_for_telegram_user(
-        &base_url,
-        access_token.as_str(),
-        telegram_user.id.0,
-    )
-    .await
-    {
+    let (mut base_url, mut access_token) =
+        match panel_api_context(bot, state, "خواندن فهرست کلاینت‌ها").await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not prepare panel connection for client listing: {error:#}");
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let clients = match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        "list panel clients",
+        panel::panel_clients_for_telegram_user(
+            &base_url,
+            access_token.as_str(),
+            telegram_user.id.0
+        )
+    ) {
         Ok(clients) => clients,
         Err(error) => {
             log::warn!(
                 "Could not list panel clients for user {}: {error}",
                 telegram_user.id
             );
+            notify_panel_issue(bot, state, &error.user_message()).await;
             edit_user_message_with_keyboard(
                 bot,
                 target,
@@ -3028,43 +3224,49 @@ async fn send_renewal_plans(
     state: &AppState,
     selected_username: &str,
 ) -> Result<()> {
-    let (base_url, access_token) = match panel_api_context(state) {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not prepare panel connection for renewal: {error:#}");
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let clients = match panel::panel_clients_for_telegram_user(
-        &base_url,
-        access_token.as_str(),
-        telegram_user.id.0,
-    )
-    .await
-    {
+    let (mut base_url, mut access_token) =
+        match panel_api_context(bot, state, "بررسی کلاینت برای تمدید").await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "بررسی اشتراک فعلاً در دسترس نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not prepare panel connection for renewal: {error:#}");
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let clients = match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        "verify renewal client",
+        panel::panel_clients_for_telegram_user(
+            &base_url,
+            access_token.as_str(),
+            telegram_user.id.0
+        )
+    ) {
         Ok(clients) => clients,
         Err(error) => {
             log::warn!(
                 "Could not verify renewal client for user {}: {error}",
                 telegram_user.id
             );
+            notify_panel_issue(bot, state, &error.user_message()).await;
             edit_user_message_with_keyboard(
                 bot,
                 target,
@@ -3129,39 +3331,44 @@ async fn send_subscription_usage(
     state: &AppState,
     username: &str,
 ) -> Result<()> {
-    let (base_url, access_token) = match panel_api_context(state) {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "بررسی موجودی اشتراک فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not prepare panel connection for usage lookup: {error:#}");
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (mut base_url, mut access_token) =
+        match panel_api_context(bot, state, "خواندن وضعیت اشتراک").await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "بررسی موجودی اشتراک فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not prepare panel connection for usage lookup: {error:#}");
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
-    match panel::subscription_usage(
-        &base_url,
-        access_token.as_str(),
-        telegram_user.id.0,
-        username,
-    )
-    .await
-    {
+    match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        "read subscription usage",
+        panel::subscription_usage(
+            &base_url,
+            access_token.as_str(),
+            telegram_user.id.0,
+            username
+        )
+    ) {
         Ok(Some(usage)) => {
             edit_user_message_with_keyboard(
                 bot,
@@ -3188,6 +3395,7 @@ async fn send_subscription_usage(
                 "Could not look up subscription usage for user {}: {error}",
                 telegram_user.id
             );
+            notify_panel_issue(bot, state, &error.user_message()).await;
             edit_user_message_with_keyboard(
                 bot,
                 target,
@@ -3208,39 +3416,44 @@ async fn send_client_subscription_link(
     state: &AppState,
     username: &str,
 ) -> Result<()> {
-    let (base_url, access_token) = match panel_api_context(state) {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "دریافت لینک کانفیگ فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not prepare panel connection for link retrieval: {error:#}");
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let (mut base_url, mut access_token) =
+        match panel_api_context(bot, state, "دریافت لینک اشتراک").await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "دریافت لینک کانفیگ فعلاً ممکن نیست؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not prepare panel connection for link retrieval: {error:#}");
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن اطلاعات پنل انجام نشد؛ لطفاً کمی بعد دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
-    match panel::subscription_link(
-        &base_url,
-        access_token.as_str(),
-        telegram_user.id.0,
-        username,
-    )
-    .await
-    {
+    match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        "retrieve subscription link",
+        panel::subscription_link(
+            &base_url,
+            access_token.as_str(),
+            telegram_user.id.0,
+            username
+        )
+    ) {
         Ok(Some(url)) => {
             let caption = subscription_link_caption(username, &url);
             if let Err(error) = edit_subscription_qr(bot, target, &url, &caption).await {
@@ -3274,6 +3487,7 @@ async fn send_client_subscription_link(
                 "Could not retrieve subscription link for user {}: {error}",
                 telegram_user.id
             );
+            notify_panel_issue(bot, state, &error.user_message()).await;
             edit_user_message_with_keyboard(
                 bot,
                 target,
@@ -3458,43 +3672,49 @@ async fn create_subscription_order(
     let target = require_callback_message_target(target)?;
     let telegram_user_id = telegram_user.id;
 
-    let (base_url, access_token) = match panel_api_context(state) {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            edit_user_message_with_keyboard(
+    let (mut base_url, mut access_token) =
+        match panel_api_context(bot, state, "بررسی پنل برای ثبت سفارش").await {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                edit_user_message_with_keyboard(
                 bot,
                 target,
                 "اتصال پنل برقرار نیست و امکان ثبت سفارش وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید.",
                 subscription_back_keyboard(),
             )
             .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not prepare panel connection for order: {error:#}");
-            edit_user_message_with_keyboard(
-                bot,
-                target,
-                "خواندن تنظیمات پنل انجام نشد. لطفاً بعداً دوباره تلاش کنید.",
-                subscription_back_keyboard(),
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let clients = match panel::panel_clients_for_telegram_user(
-        &base_url,
-        access_token.as_str(),
-        telegram_user_id.0,
-    )
-    .await
-    {
+                return Ok(());
+            }
+            Err(error) => {
+                log::error!("Could not prepare panel connection for order: {error:#}");
+                edit_user_message_with_keyboard(
+                    bot,
+                    target,
+                    "خواندن تنظیمات پنل انجام نشد. لطفاً بعداً دوباره تلاش کنید.",
+                    subscription_back_keyboard(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let clients = match retry_panel_request!(
+        state,
+        base_url,
+        access_token,
+        "verify client before order",
+        panel::panel_clients_for_telegram_user(
+            &base_url,
+            access_token.as_str(),
+            telegram_user_id.0
+        )
+    ) {
         Ok(clients) => clients,
         Err(error) => {
             log::warn!(
                 "Could not verify panel clients for user {}: {error}",
                 telegram_user_id
             );
+            notify_panel_issue(bot, state, &error.user_message()).await;
             edit_user_message_with_keyboard(
                 bot,
                 target,
@@ -3544,14 +3764,18 @@ async fn create_subscription_order(
                 reserved.push(client.username.clone());
             }
         }
-        let username = match panel::suggest_available_panel_username(
-            &base_url,
-            access_token.as_str(),
-            telegram_user_id.0,
-            &reserved,
-        )
-        .await
-        {
+        let username = match retry_panel_request!(
+            state,
+            base_url,
+            access_token,
+            "suggest panel username",
+            panel::suggest_available_panel_username(
+                &base_url,
+                access_token.as_str(),
+                telegram_user_id.0,
+                &reserved
+            )
+        ) {
             Ok(Some(username)) => username,
             Ok(None) => {
                 edit_user_message_with_keyboard(
@@ -3571,6 +3795,7 @@ async fn create_subscription_order(
                     "Could not choose an available username for user {}: {error}",
                     telegram_user_id
                 );
+                notify_panel_issue(bot, state, &error.user_message()).await;
                 edit_user_message_with_keyboard(
                     bot,
                     target,
@@ -4069,48 +4294,20 @@ async fn approve_payment_order(
             return Ok(());
         }
     };
-    let Some(access_token) = state.panel_access_token() else {
-        let released = release_order_for_retry(state, order_id);
-        bot.send_message(
-            reviewer_id,
-            if released {
-                "نشست پنل فعال نیست؛ پس از اتصال پنل دوباره سفارش را تأیید کنید."
-            } else {
-                "نشست پنل فعال نیست و وضعیت سفارش به صف بررسی برنگشت؛ برای جلوگیری از فعال‌سازی تکراری با پشتیبانی فنی تماس بگیرید."
-            },
-        )
-        .await?;
-        return Ok(());
-    };
-    let (saved_url, _) = match state.panel_config() {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            release_order_for_retry(state, order_id);
-            bot.send_message(reviewer_id, "تنظیمات پنل موجود نیست؛ سفارش تأیید نشد.")
+    let (base_url, access_token) = match panel_api_context(bot, state, "تأیید سفارش").await
+    {
+        Ok(Some(context)) => context,
+        Ok(None) | Err(_) => {
+            let released = release_order_for_retry(state, order_id);
+            bot.send_message(
+                    reviewer_id,
+                    if released {
+                        "اتصال پنل برقرار نشد؛ پس از بررسی پنل، سفارش را دوباره تأیید کنید."
+                    } else {
+                        "اتصال پنل برقرار نشد و وضعیت سفارش به صف بررسی برنگشت؛ برای جلوگیری از فعال‌سازی تکراری با پشتیبانی فنی تماس بگیرید."
+                    },
+                )
                 .await?;
-            return Ok(());
-        }
-        Err(error) => {
-            log::error!("Could not read panel configuration for order {order_id}: {error}");
-            release_order_for_retry(state, order_id);
-            bot.send_message(
-                reviewer_id,
-                "خواندن تنظیمات پنل انجام نشد؛ لاگ برنامه را بررسی کنید.",
-            )
-            .await?;
-            return Ok(());
-        }
-    };
-    let base_url = match panel::normalize_panel_url(&saved_url) {
-        Ok(url) => url,
-        Err(error) => {
-            log::error!("Saved panel URL is invalid during order approval: {error}");
-            release_order_for_retry(state, order_id);
-            bot.send_message(
-                reviewer_id,
-                "آدرس پنل معتبر نیست؛ مالک باید تنظیمات پنل را بررسی کند.",
-            )
-            .await?;
             return Ok(());
         }
     };
@@ -4127,23 +4324,38 @@ async fn approve_payment_order(
     .await
     {
         Ok(subscription) => {
-            if let Err(error) = state.complete_payment_order(
+            let referral_credit = match state.complete_payment_order(
                 order_id,
                 order.telegram_user_id,
                 &subscription.username,
             ) {
-                log::error!(
-                    "Panel provisioning succeeded for order {order_id}, but saving its status failed: {error}"
-                );
-                bot.send_message(
-                    reviewer_id,
-                    format!(
-                        "⚠️ اشتراک سفارش #{} در پنل فعال شد، اما ثبت نتیجه در دیتابیس خطا داشت. این سفارش را دوباره تأیید نکنید و با پشتیبانی فنی تماس بگیرید.",
-                        persian_digits(order_id)
-                    ),
-                )
-                .await?;
-                return Ok(());
+                Ok(completion) => completion.referral_credit,
+                Err(error) => {
+                    log::error!(
+                        "Panel provisioning succeeded for order {order_id}, but saving its status failed: {error}"
+                    );
+                    bot.send_message(
+                        reviewer_id,
+                        format!(
+                            "⚠️ اشتراک سفارش #{} در پنل فعال شد، اما ثبت نتیجه در دیتابیس خطا داشت. این سفارش را دوباره تأیید نکنید و با پشتیبانی فنی تماس بگیرید.",
+                            persian_digits(order_id)
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            if let Some(credit) = referral_credit {
+                let message = referral_commission_notification(&credit, order.is_renewal);
+                if let Err(error) = bot
+                    .send_message(UserId(credit.referrer_user_id), message)
+                    .await
+                {
+                    log::warn!(
+                        "Could not notify referrer {} about commission for order {order_id}: {error}",
+                        credit.referrer_user_id
+                    );
+                }
             }
             finalize_payment_review_messages(
                 bot,
@@ -4196,6 +4408,7 @@ async fn approve_payment_order(
         }
         Err(error) => {
             log::error!("Could not provision approved order {order_id}: {error}");
+            notify_panel_issue(bot, state, &error.user_message()).await;
             let released = release_order_for_retry(state, order_id);
             bot.send_message(
                 reviewer_id,
@@ -5679,6 +5892,22 @@ fn referral_message(link: &str, referrals: u64, commissions: i64, percent: u8) -
     )
 }
 
+fn referral_commission_notification(
+    credit: &state::ReferralCommissionCredit,
+    is_renewal: bool,
+) -> String {
+    let action = if is_renewal {
+        "اشتراک خود را با موفقیت تمدید کرد"
+    } else {
+        "یک اشتراک را با موفقیت خرید"
+    };
+    format!(
+        "🎉 تبریک! یکی از زیرمجموعه‌های شما {action}.\n💰 مبلغ {} به کیف پول شما اضافه شد.\n👛 موجودی جدید کیف پول شما: {}",
+        format_signed_toman(credit.amount_toman),
+        format_signed_toman(credit.balance_after_toman)
+    )
+}
+
 fn purchase_menu_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(vec![
         vec![InlineKeyboardButton::callback(
@@ -6106,6 +6335,34 @@ fn panel_keyboard() -> InlineKeyboardMarkup {
 mod tests {
     use super::*;
     use teloxide::types::InlineKeyboardButtonKind;
+
+    #[test]
+    fn reconnects_panel_after_transient_or_expired_session_errors() {
+        assert!(should_reconnect_after_panel_error(
+            &panel::PanelError::Request
+        ));
+        assert!(should_reconnect_after_panel_error(
+            &panel::PanelError::HttpStatus(401)
+        ));
+        assert!(should_reconnect_after_panel_error(
+            &panel::PanelError::HttpStatus(503)
+        ));
+        assert!(!should_reconnect_after_panel_error(
+            &panel::PanelError::HttpStatus(403)
+        ));
+        assert!(!should_reconnect_after_panel_error(
+            &panel::PanelError::UserNotFound
+        ));
+    }
+
+    #[test]
+    fn retries_panel_authentication_only_for_transient_errors() {
+        assert!(is_transient_panel_error(&panel::PanelError::Request));
+        assert!(is_transient_panel_error(&panel::PanelError::HttpStatus(
+            503
+        )));
+        assert!(!is_transient_panel_error(&panel::PanelError::Unauthorized));
+    }
 
     #[test]
     fn formats_prices_with_persian_digits_and_separators() {
@@ -6920,6 +7177,24 @@ mod tests {
         assert!(message.contains("به کیف پول شما اضافه می‌شود"));
         assert!(message.contains("https://t.me/foxngbot?start=ref_123"));
         assert!(message.contains("مجموع پورسانت ثبت‌شده: ۱۵٬۰۰۰ تومان"));
+    }
+
+    #[test]
+    fn referral_commission_notice_reports_purchase_or_renewal_and_new_balance() {
+        let credit = state::ReferralCommissionCredit {
+            referrer_user_id: 10,
+            amount_toman: 17_000,
+            balance_after_toman: 42_000,
+        };
+
+        let purchase = referral_commission_notification(&credit, false);
+        assert!(purchase.contains("🎉"));
+        assert!(purchase.contains("یکی از زیرمجموعه‌های شما یک اشتراک را با موفقیت خرید"));
+        assert!(purchase.contains("مبلغ ۱۷٬۰۰۰ تومان به کیف پول شما اضافه شد"));
+        assert!(purchase.contains("موجودی جدید کیف پول شما: ۴۲٬۰۰۰ تومان"));
+
+        let renewal = referral_commission_notification(&credit, true);
+        assert!(renewal.contains("یکی از زیرمجموعه‌های شما اشتراک خود را با موفقیت تمدید کرد"));
     }
 
     #[test]
