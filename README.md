@@ -7,5 +7,5 @@ curl -fsSL https://github.com/logicblade/FalconBOT/releases/latest/download/inst
 Run this command from an interactive terminal; the installer prompts for your Telegram bot token and owner ID.
 
 ```bash
-curl -fsSL https://github.com/logicblade/FalconBOT/releases/latest/download/update.sh
+curl -fsSL https://github.com/logicblade/FalconBOT/releases/latest/download/update.sh | bash
 ```
