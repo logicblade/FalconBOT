@@ -248,6 +248,7 @@ impl AppState {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 base_url TEXT NOT NULL,
                 username TEXT NOT NULL,
+                password TEXT,
                 connected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+03:30', 'now', '+03:30'))
             );
             CREATE TABLE IF NOT EXISTS panel_users (
@@ -358,6 +359,7 @@ impl AppState {
         migrate_financial_transaction_constraints(&database)?;
         migrate_payment_wallet_columns(&database)?;
         seed_subscription_tariffs(&database)?;
+        migrate_panel_password_column(&database)?;
         database.execute_batch(
             "UPDATE panel_settings
              SET connected_at = strftime('%Y-%m-%dT%H:%M:%f+03:30', connected_at, '+03:30')
@@ -2040,23 +2042,44 @@ impl AppState {
     }
 
     pub fn save_panel_password(&self, password: &str) -> Result<()> {
-        let entry = keyring::Entry::new("foxngbot-rust", &self.owner_id.0.to_string())
-            .context("Could not access the operating-system credential store")?;
-        entry
-            .set_password(password)
-            .context("Could not save the panel password in the operating-system credential store")
+        self.database
+            .lock()
+            .expect("database lock poisoned")
+            .execute(
+                "UPDATE panel_settings SET password = ?1 WHERE id = 1",
+                params![password],
+            )
+            .context("Could not save the panel password in the database")?;
+        if let Ok(entry) = keyring::Entry::new("foxngbot-rust", &self.owner_id.0.to_string()) {
+            let _ = entry.set_password(password);
+        }
+        Ok(())
     }
 
     pub fn panel_password(&self) -> Result<Option<Zeroizing<String>>> {
-        let entry = keyring::Entry::new("foxngbot-rust", &self.owner_id.0.to_string())
-            .context("Could not access the operating-system credential store")?;
-        match entry.get_password() {
-            Ok(password) => Ok(Some(Zeroizing::new(password))),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(error).context(
-                "Could not read the panel password from the operating-system credential store",
-            ),
+        let password: Option<String> = self
+            .database
+            .lock()
+            .expect("database lock poisoned")
+            .query_row(
+                "SELECT password FROM panel_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Could not read the panel password from the database")?;
+        if let Some(password) = password {
+            return Ok(Some(Zeroizing::new(password)));
         }
+
+        if let Ok(entry) = keyring::Entry::new("foxngbot-rust", &self.owner_id.0.to_string()) {
+            if let Ok(password) = entry.get_password() {
+                self.save_panel_password(&password)
+                    .context("Could not migrate the saved panel password into the database")?;
+                return Ok(Some(Zeroizing::new(password)));
+            }
+        }
+        Ok(None)
     }
 
     pub fn set_session(&self, access_token: Zeroizing<String>) {
@@ -2138,6 +2161,19 @@ fn migrate_commerce_settings(database: &Connection) -> rusqlite::Result<()> {
              UPDATE commerce_settings
                 SET renewals_enabled = purchases_enabled;",
         )?;
+    }
+    Ok(())
+}
+
+fn migrate_panel_password_column(database: &Connection) -> rusqlite::Result<()> {
+    let has_column = database
+        .prepare("PRAGMA table_info(panel_settings)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "password");
+    if !has_column {
+        database.execute_batch("ALTER TABLE panel_settings ADD COLUMN password TEXT;")?;
     }
     Ok(())
 }

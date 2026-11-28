@@ -1769,8 +1769,10 @@ async fn handle_message(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<
                     let credential_warning = match state.save_panel_password(&password) {
                         Ok(()) => "",
                         Err(error) => {
-                            log::error!("Could not save panel credentials in the operating-system credential store: {error}");
-                            "\n⚠️ ذخیره‌ی امن گذرواژه انجام نشد؛ ورود خودکار پس از راه‌اندازی مجدد فعال نخواهد بود."
+                            log::error!(
+                                "Could not save panel credentials in the database: {error}"
+                            );
+                            "\n⚠️ ذخیره‌ی گذرواژه در دیتابیس انجام نشد؛ اتصال خودکار ممکن نیست."
                         }
                     };
                     state.set_session(access_token);
